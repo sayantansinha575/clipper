@@ -1,0 +1,6 @@
+{
+  "name": "AI Shorts Studio",
+  "description": "Self-hosted AI video clipping studio converting long-form videos into vertical 9:16 shorts with speech transcription, Gemini clip selection, animated ASS captions, and FFmpeg rendering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

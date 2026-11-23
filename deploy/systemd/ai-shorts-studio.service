@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Shorts Studio
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ai-shorts-studio
+Environment=NODE_ENV=production
+Environment=PORT=3000
+EnvironmentFile=/opt/ai-shorts-studio/.env
+ExecStart=/usr/bin/node /opt/ai-shorts-studio/server.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
