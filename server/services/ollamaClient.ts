@@ -87,10 +87,14 @@ export async function generateOllamaJson<T>(params: {
   systemPrompt: string;
   userPrompt: string;
   timeoutMs?: number;
+  numCtx?: number;
+  numPredict?: number;
   isCancelled?: () => boolean;
 }): Promise<T> {
   const cleanUrl = normalizeOllamaBaseUrl(params.baseUrl);
-  const timeoutMs = params.timeoutMs ?? 45_000;
+  const timeoutMs = params.timeoutMs ?? 180_000;
+  const numCtx = params.numCtx ?? 4096;
+  const numPredict = params.numPredict ?? 900;
 
   const sendChatRequest = async (includeThinkFlag: boolean): Promise<Response> => {
     const controller = new AbortController();
@@ -110,8 +114,8 @@ export async function generateOllamaJson<T>(params: {
         format: 'json',
         options: {
           temperature: 0.2,
-          num_ctx: 4096,
-          num_predict: 1200,
+          num_ctx: numCtx,
+          num_predict: numPredict,
         },
         messages: [
           { role: 'system', content: params.systemPrompt },

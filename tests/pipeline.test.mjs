@@ -149,6 +149,42 @@ test('generateClipSubtitles creates valid ASS & SRT files', () => {
   assert.ok(assContent.includes('Dialogue:'));
 });
 
+test('generateClipSubtitles splits phrases on pauses so captions do not freeze across silence', () => {
+  const transcript = {
+    language: 'en',
+    duration: 16,
+    hasSpeech: true,
+    segments: [
+      {
+        start: 1.0,
+        end: 13.0,
+        text: 'Holy shit, is',
+        words: [
+          { word: 'Holy', start: 1.0, end: 1.25 },
+          { word: 'shit,', start: 1.25, end: 1.55 },
+          { word: 'is', start: 12.2, end: 12.5 },
+        ],
+      },
+    ],
+  };
+
+  const subs = generateClipSubtitles({
+    clipId: 'test_clip_pause_split',
+    transcript,
+    clipStart: 0,
+    clipEnd: 15,
+    style: CAPTION_PRESETS.viral_yellow,
+    playResX: 720,
+    playResY: 1280,
+  });
+
+  GENERATED_FILES.push(subs.assPath, subs.srtPath);
+  assert.equal(subs.cueCount, 2);
+  const srt = fs.readFileSync(subs.srtPath, 'utf-8');
+  assert.ok(srt.includes('00:00:01,000 --> 00:00:01,550'));
+  assert.ok(srt.includes('00:00:12,200 --> 00:00:12,500'));
+});
+
 test('renderClipWithFfmpeg renders 9:16 vertical MP4 with ASS subtitles and validates output', async () => {
   const assPath = path.join(DIRS.subtitles, 'test_clip_01.ass');
   const rendered = await renderClipWithFfmpeg({
@@ -321,6 +357,64 @@ test('Ollama JSON stripping, URL normalization, and rate-limit error detection',
     assert.equal(res.clips.length, 1);
     assert.equal(res.clips[0].title, 'Qwen Hook');
     assert.ok(res.aiNotes.includes('qwen3.4:4b'));
+  } finally {
+    server.close();
+  }
+});
+
+test('Ollama failure in speech path falls back to speech-aligned clips without crashing', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('Internal error');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const res = await selectClipsWithGemini({
+      videoPath: TEST_VIDEO,
+      jobId: 'ollama_fallback_test',
+      videoDuration: 30.0,
+      transcript: {
+        language: 'en',
+        duration: 30.0,
+        hasSpeech: true,
+        segments: [
+          { start: 1, end: 5, text: 'First line', words: [{ word: 'First', start: 1, end: 2 }] },
+          { start: 16, end: 20, text: 'Second line', words: [{ word: 'Second', start: 16, end: 17 }] },
+        ],
+      },
+      scenes: [1, 16],
+      config: {
+        clipCount: 2,
+        minDuration: 5,
+        maxDuration: 12,
+        aspectRatio: '9:16',
+        outputResolution: '720x1280',
+        selectionFocus: 'best_moments',
+        customInstructions: '',
+        captionStyle: CAPTION_PRESETS.viral_yellow,
+        effects: {
+          cropMode: 'blurred_bg',
+          subtleZoomIn: false,
+          zoomOut: false,
+          fadeInOut: false,
+          audioNormalize: false,
+        },
+      },
+      aiSettings: {
+        provider: 'ollama_only',
+        model: 'gemini-4-hydrogen',
+        ollamaBaseUrl: baseUrl,
+        ollamaModel: 'qwen3.5:4b',
+        defaultInstructions: '',
+        maxClips: 50,
+        geminiKeyConfigured: false,
+      },
+    });
+    assert.ok(res.clips.length >= 1);
+    assert.ok(res.aiNotes.includes('speech-aligned'));
   } finally {
     server.close();
   }

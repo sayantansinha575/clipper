@@ -47,24 +47,97 @@ export function isRateLimitOrFallbackError(err: unknown): boolean {
   );
 }
 
-function chunkSegments(
-  transcript: TranscriptData,
-  maxSegmentsPerChunk = 100,
-  overlapSegments = 12
-) {
-  const segs = transcript.segments;
-  if (segs.length <= maxSegmentsPerChunk) {
-    return [segs];
+function chunkSegmentArray<T>(
+  items: T[],
+  maxPerChunk: number,
+  overlap: number
+): T[][] {
+  if (items.length <= maxPerChunk) {
+    return items.length > 0 ? [items] : [];
   }
-  const chunks: typeof segs[] = [];
+  const chunks: T[][] = [];
   let start = 0;
-  while (start < segs.length) {
-    const end = Math.min(segs.length, start + maxSegmentsPerChunk);
-    chunks.push(segs.slice(start, end));
-    if (end >= segs.length) break;
-    start = end - overlapSegments;
+  while (start < items.length) {
+    const end = Math.min(items.length, start + maxPerChunk);
+    chunks.push(items.slice(start, end));
+    if (end >= items.length) break;
+    start = Math.max(start + 1, end - overlap);
   }
   return chunks;
+}
+
+type CompactBlock = { start: number; end: number; text: string };
+
+function compactSegmentsForOllama(
+  segments: TranscriptData['segments'],
+  targetBlockSec = 18,
+  maxGapSec = 2.0,
+  maxChars = 340
+): CompactBlock[] {
+  const blocks: CompactBlock[] = [];
+  let cur: CompactBlock | null = null;
+
+  for (const seg of segments) {
+    const clean = (seg.text || '').trim();
+    if (!clean) continue;
+
+    if (!cur) {
+      cur = { start: seg.start, end: seg.end, text: clean };
+      continue;
+    }
+
+    const gap = seg.start - cur.end;
+    const span = seg.end - cur.start;
+    if (gap <= maxGapSec && span <= targetBlockSec && cur.text.length + clean.length + 1 <= maxChars) {
+      cur.end = Math.max(cur.end, seg.end);
+      cur.text = `${cur.text} ${clean}`;
+    } else {
+      blocks.push(cur);
+      cur = { start: seg.start, end: seg.end, text: clean };
+    }
+  }
+  if (cur) blocks.push(cur);
+  return blocks;
+}
+
+function selectTopChunksAcrossTimeline(
+  chunks: CompactBlock[][],
+  scenes: number[],
+  maxChunks = 10
+): CompactBlock[][] {
+  if (chunks.length <= maxChunks) return chunks;
+
+  const scoreChunk = (chunk: CompactBlock[]): number => {
+    const start = chunk[0].start;
+    const end = chunk[chunk.length - 1].end;
+    const span = Math.max(1, end - start);
+    let textLen = 0;
+    let cues = 0;
+    for (const b of chunk) {
+      textLen += b.text.length;
+      cues += (b.text.match(/[!?]/g) || []).length;
+    }
+    const sceneCount = scenes.filter((s) => s >= start && s <= end).length;
+    return textLen / span + cues * 2.5 + sceneCount * 1.5;
+  };
+
+  // Pick the highest-signal chunk from each even timeline bucket for full start-to-end coverage
+  const selected: CompactBlock[][] = [];
+  for (let b = 0; b < maxChunks; b++) {
+    const lo = Math.floor((b * chunks.length) / maxChunks);
+    const hi = Math.max(lo + 1, Math.floor(((b + 1) * chunks.length) / maxChunks));
+    let bestIdx = lo;
+    let bestScore = -1;
+    for (let i = lo; i < hi; i++) {
+      const s = scoreChunk(chunks[i]);
+      if (s > bestScore) {
+        bestScore = s;
+        bestIdx = i;
+      }
+    }
+    selected.push(chunks[bestIdx]);
+  }
+  return selected;
 }
 
 async function selectChunkWithOllama(params: {
@@ -84,7 +157,9 @@ async function selectChunkWithOllama(params: {
     model: params.ollamaModel,
     systemPrompt,
     userPrompt: params.prompt,
-    timeoutMs: 45_000,
+    timeoutMs: 180_000,
+    numCtx: 2048,
+    numPredict: 700,
     isCancelled: params.isCancelled,
   });
 }
@@ -140,6 +215,53 @@ function buildSceneFallbackClips(
   }
 
   return raw;
+}
+
+function buildSpeechFallbackClips(
+  segments: TranscriptData['segments'],
+  scenes: number[],
+  videoDuration: number,
+  minDur: number,
+  maxDur: number,
+  desiredCount: number,
+  focus: SelectionFocus
+): RawCandidateClip[] {
+  if (segments.length === 0) {
+    return buildSceneFallbackClips(scenes, videoDuration, minDur, maxDur, desiredCount, focus);
+  }
+  const raw: RawCandidateClip[] = [];
+  const targetDur = Math.min(maxDur, Math.max(minDur, Math.min(45, (minDur + maxDur) / 2)));
+  const usableCount = Math.min(desiredCount, Math.max(1, Math.floor(videoDuration / Math.max(minDur, 1))));
+  const spacing = videoDuration / usableCount;
+
+  for (let i = 0; i < usableCount; i++) {
+    const windowStart = i * spacing;
+    const windowEnd = Math.min(videoDuration - minDur, windowStart + spacing * 0.65);
+    const anchor =
+      segments.find((s) => s.start >= windowStart && s.start <= windowEnd) ||
+      segments.find((s) => s.start >= windowStart);
+
+    const start = anchor
+      ? Math.min(Math.max(0, anchor.start), Math.max(0, videoDuration - minDur))
+      : Math.min(windowStart, Math.max(0, videoDuration - minDur));
+    const end = Math.min(videoDuration, start + targetDur);
+    if (end - start < minDur) continue;
+
+    const preview = (anchor?.text || 'Speech highlight').trim().slice(0, 75);
+    raw.push({
+      start: Number(start.toFixed(2)),
+      end: Number(end.toFixed(2)),
+      title: `Highlight ${raw.length + 1}`,
+      hook: preview || `Highlight starting at ${start.toFixed(1)}s`,
+      reason: 'Aligned to spoken transcript segment across video timeline.',
+      category: focus,
+      score: 76,
+    });
+  }
+
+  return raw.length > 0
+    ? raw
+    : buildSceneFallbackClips(scenes, videoDuration, minDur, maxDur, desiredCount, focus);
 }
 
 export async function selectClipsWithGemini(params: {
@@ -338,7 +460,11 @@ export async function selectClipsWithGemini(params: {
   }
 
   // Speech transcript chunked selection
-  const chunks = chunkSegments(transcript);
+  const ollamaCompactAll = compactSegmentsForOllama(transcript.segments);
+  const chunks: CompactBlock[][] = useOllamaActive
+    ? selectTopChunksAcrossTimeline(chunkSegmentArray(ollamaCompactAll, 18, 2), scenes, 10)
+    : chunkSegmentArray(transcript.segments, 100, 12);
+
   const allCandidates: RawCandidateClip[] = [];
   const notesList: string[] = [];
 
@@ -353,39 +479,61 @@ export async function selectClipsWithGemini(params: {
     onProgress?.(
       40 + Math.round(((idx + 0.5) / chunks.length) * 14),
       useOllamaActive
-        ? `Analyzing chunk ${idx + 1}/${chunks.length} with local Ollama (${aiSettings.ollamaModel})...`
+        ? `Analyzing window ${idx + 1}/${chunks.length} with local Ollama (${aiSettings.ollamaModel})...`
         : `Analyzing chunk ${idx + 1}/${chunks.length} with Gemini (${modelToUse})...`
     );
 
     const relevantScenes = scenes.filter((s) => s >= chunkStart && s <= chunkEnd);
-    const formattedTranscript = chunk
-      .map((s) => `[${s.start.toFixed(2)} - ${s.end.toFixed(2)}] ${s.text}`)
-      .join('\n');
+    const buildPromptForBlock = (items: CompactBlock[], concise: boolean) => {
+      const formatted = items
+        .map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`)
+        .join('\n');
+      return [
+        `Video duration: ${videoDuration.toFixed(1)}s | Window: ${chunkStart.toFixed(1)}s-${chunkEnd.toFixed(1)}s.`,
+        `Scene cuts: ${relevantScenes.slice(0, concise ? 15 : 40).join(', ') || 'none'}.`,
+        `Select up to ${targetPerChunk} standalone clips (${minDur}s-${maxDur}s each).`,
+        `Focus: ${FOCUS_PROMPTS[config.selectionFocus]}`,
+        config.customInstructions ? `Extra instructions: ${config.customInstructions}` : '',
+        concise
+          ? 'Pick clips with strong opening hooks, complete standalone thoughts, and zero overlapping ranges.'
+          : [
+              'Criteria:',
+              '1. Strong opening hook in the first 3 seconds.',
+              '2. Complete standalone meaning — never cut mid-sentence.',
+              '3. High emotional, educational, storytelling, humor, or surprising insight.',
+              '4. Avoid long silences, filler, or overlapping clips.',
+              '5. Never fabricate dialogue; only use timestamps from the transcript below.',
+            ].join('\n'),
+        `\nTRANSCRIPT:\n${formatted}`,
+      ]
+        .filter(Boolean)
+        .join('\n');
+    };
 
-    const prompt = [
-      `You are an expert short-form video editor selecting viral YouTube Shorts / Reels / TikTok clips.`,
-      `Source video total duration: ${videoDuration.toFixed(2)} seconds.`,
-      `Transcript window: ${chunkStart.toFixed(2)}s to ${chunkEnd.toFixed(2)}s.`,
-      `Nearby scene cut timestamps: ${relevantScenes.slice(0, 40).join(', ') || 'none'}.`,
-      `Target: Select up to ${targetPerChunk} standout clips from this window.`,
-      `Clip duration constraint: strictly between ${minDur}s and ${maxDur}s per clip.`,
-      `Selection focus: ${FOCUS_PROMPTS[config.selectionFocus]}`,
-      config.customInstructions ? `Additional instructions: ${config.customInstructions}` : '',
-      `Criteria:`,
-      `1. Strong opening hook in the first 3 seconds.`,
-      `2. Complete standalone meaning — never cut mid-sentence or require watching earlier context.`,
-      `3. High emotional, educational, storytelling, humor, or surprising insight.`,
-      `4. Avoid long silences, filler, or overlapping clips.`,
-      `5. Never fabricate dialogue; only use timestamps supported by the transcript below.`,
-      `If this window does not have enough quality material for ${targetPerChunk} clips, return fewer clips and explain why in "notes".`,
-      `\nTRANSCRIPT:\n${formattedTranscript}`,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const runOllamaSafe = async (items: CompactBlock[]): Promise<{ clips?: RawCandidateClip[]; notes?: string }> => {
+      const compactItems = items.length > 22 ? compactSegmentsForOllama(items as TranscriptData['segments']) : items;
+      const sliced = compactItems.length > 22 ? compactItems.slice(0, 22) : compactItems;
+      try {
+        return await selectChunkWithOllama({
+          ollamaBaseUrl: aiSettings.ollamaBaseUrl,
+          ollamaModel: aiSettings.ollamaModel,
+          prompt: buildPromptForBlock(sliced, true),
+          isCancelled,
+        });
+      } catch (ollamaErr) {
+        if (isCancelled?.()) {
+          throw new Error('Job cancelled by user');
+        }
+        const msg = ollamaErr instanceof Error ? ollamaErr.message : String(ollamaErr);
+        notesList.push(`Window ${idx + 1} skipped (${msg.slice(0, 80)}).`);
+        return { clips: [] };
+      }
+    };
 
     let parsed: { clips?: RawCandidateClip[]; notes?: string };
 
     if (!useOllamaActive) {
+      const prompt = buildPromptForBlock(chunk, false);
       try {
         const ai = getGeminiClient();
         parsed = await withRetry(async () => {
@@ -433,25 +581,15 @@ export async function selectClipsWithGemini(params: {
           fallbackTriggered = true;
           onProgress?.(
             40 + Math.round(((idx + 0.5) / chunks.length) * 14),
-            `Gemini quota/rate-limit hit; switching chunk ${idx + 1} to local Ollama (${aiSettings.ollamaModel})...`
+            `Gemini unavailable/rate-limited; switching to local Ollama (${aiSettings.ollamaModel})...`
           );
-          parsed = await selectChunkWithOllama({
-            ollamaBaseUrl: aiSettings.ollamaBaseUrl,
-            ollamaModel: aiSettings.ollamaModel,
-            prompt,
-            isCancelled,
-          });
+          parsed = await runOllamaSafe(chunk);
         } else {
           throw err;
         }
       }
     } else {
-      parsed = await selectChunkWithOllama({
-        ollamaBaseUrl: aiSettings.ollamaBaseUrl,
-        ollamaModel: aiSettings.ollamaModel,
-        prompt,
-        isCancelled,
-      });
+      parsed = await runOllamaSafe(chunk);
     }
 
     if (parsed.notes) notesList.push(parsed.notes);
@@ -469,26 +607,25 @@ export async function selectClipsWithGemini(params: {
   );
 
   if (validated.length === 0 && videoDuration >= 3) {
-    const fallbackEnd = Math.min(videoDuration, maxDur);
-    validated = validateClipTimestamps(
-      [
-        {
-          start: 0,
-          end: fallbackEnd,
-          title: 'Primary Video Segment',
-          hook: transcript.segments[0]?.text.slice(0, 100) || 'Opening segment',
-          reason: 'Full available segment matching configured duration limits.',
-          category: config.selectionFocus,
-          score: 75,
-        },
-      ],
+    const fallbackMin = Math.min(minDur, videoDuration);
+    const fallbackClips = buildSpeechFallbackClips(
+      transcript.segments,
+      scenes,
       videoDuration,
-      Math.min(3, videoDuration),
+      fallbackMin,
       maxDur,
-      1
+      desiredCount,
+      config.selectionFocus
+    );
+    validated = validateClipTimestamps(
+      fallbackClips,
+      videoDuration,
+      fallbackMin,
+      maxDur,
+      desiredCount
     );
     notesList.push(
-      `Source duration (${videoDuration.toFixed(1)}s) limited strict multi-clip extraction; generated ${validated.length} validated clip.`
+      `Generated ${validated.length} speech-aligned clip(s) across ${videoDuration.toFixed(1)}s timeline.`
     );
   } else if (validated.length < desiredCount) {
     notesList.push(

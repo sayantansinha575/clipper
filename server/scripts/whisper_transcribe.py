@@ -71,6 +71,8 @@ def main() -> int:
         language=lang_arg,
         word_timestamps=True,
         vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 700, "speech_pad_ms": 250},
+        condition_on_previous_text=False,
         beam_size=3,
     )
 

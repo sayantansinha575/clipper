@@ -6,24 +6,24 @@ const execFileAsync = promisify(execFile);
 export async function detectSceneChanges(
   videoPath: string,
   threshold = 0.32,
-  maxScenes = 120
+  maxScenes = 400
 ): Promise<number[]> {
   try {
-    // Use ffmpeg scene detection filter; showinfo prints pts_time to stderr
+    // Downscale & sample at 2fps so scene detection finishes quickly even on multi-hour videos
     const { stderr } = await execFileAsync(
       'ffmpeg',
       [
         '-i',
         videoPath,
         '-vf',
-        `select='gt(scene,${threshold})',showinfo`,
+        `scale=320:-2,fps=2,select='gt(scene,${threshold})',showinfo`,
         '-vsync',
         'vfr',
         '-f',
         'null',
         '-',
       ],
-      { maxBuffer: 25 * 1024 * 1024, timeout: 120_000 }
+      { maxBuffer: 25 * 1024 * 1024, timeout: 300_000 }
     );
 
     const timestamps: number[] = [];

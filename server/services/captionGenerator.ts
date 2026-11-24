@@ -84,6 +84,7 @@ function collectClipPhrases(
   clipEnd: number,
   wordsPerLine: number
 ): CaptionPhrase[] {
+  const clipDur = Math.max(0.2, clipEnd - clipStart);
   const clipWords: TranscriptWord[] = [];
 
   for (const seg of transcript.segments) {
@@ -91,7 +92,9 @@ function collectClipPhrases(
     for (const w of seg.words) {
       if (w.end <= clipStart || w.start >= clipEnd) continue;
       const localStart = Math.max(0, w.start - clipStart);
-      const localEnd = Math.min(clipEnd - clipStart, Math.max(localStart + 0.08, w.end - clipStart));
+      // Cap abnormally stretched word end times from Whisper VAD gaps
+      const rawLocalEnd = Math.min(clipDur, w.end - clipStart, localStart + 2.0);
+      const localEnd = Math.min(clipDur, Math.max(localStart + 0.08, rawLocalEnd));
       clipWords.push({
         word: w.word,
         start: Number(localStart.toFixed(3)),
@@ -101,17 +104,32 @@ function collectClipPhrases(
   }
 
   if (clipWords.length === 0) return [];
+  clipWords.sort((a, b) => a.start - b.start);
 
   const groupSize = Math.max(1, Math.min(6, wordsPerLine));
+  const maxPauseGapSec = 0.65;
   const phrases: CaptionPhrase[] = [];
-  for (let i = 0; i < clipWords.length; i += groupSize) {
-    const slice = clipWords.slice(i, i + groupSize);
+  let current: TranscriptWord[] = [];
+
+  const flushPhrase = () => {
+    if (current.length === 0) return;
     phrases.push({
-      start: slice[0].start,
-      end: Math.max(slice[0].start + 0.25, slice[slice.length - 1].end),
-      words: slice,
+      start: current[0].start,
+      end: Math.min(clipDur, Math.max(current[0].start + 0.25, current[current.length - 1].end)),
+      words: current,
     });
+    current = [];
+  };
+
+  for (const word of clipWords) {
+    const prev = current[current.length - 1];
+    if (prev && (current.length >= groupSize || word.start - prev.end > maxPauseGapSec)) {
+      flushPhrase();
+    }
+    current.push(word);
   }
+  flushPhrase();
+
   return phrases;
 }
 
@@ -216,7 +234,9 @@ export function generateClipSubtitles(params: {
       const active = renderedWords[wIdx];
       const nextWord = renderedWords[wIdx + 1];
       const segStart = wIdx === 0 ? phrase.start : active.start;
-      const segEnd = nextWord ? Math.max(active.start + 0.06, nextWord.start) : phrase.end;
+      const segEnd = nextWord
+        ? Math.min(Math.max(active.start + 0.08, nextWord.start), active.end + 0.45)
+        : phrase.end;
 
       const lineContent = renderedWords
         .map((w, j) => {

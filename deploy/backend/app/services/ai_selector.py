@@ -27,7 +27,7 @@ def _call_ollama_json(prompt: str) -> Dict[str, Any]:
         "stream": False,
         "think": False,
         "format": "json",
-        "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": 1200},
+        "options": {"temperature": 0.2, "num_ctx": 2048, "num_predict": 700},
         "messages": [
             {
                 "role": "system",
@@ -40,15 +40,36 @@ def _call_ollama_json(prompt: str) -> Dict[str, Any]:
             {"role": "user", "content": prompt},
         ],
     }
-    resp = httpx.post(url, json=payload, timeout=45.0)
+    resp = httpx.post(url, json=payload, timeout=180.0)
     if resp.status_code == 400 and "think" in resp.text.lower():
         payload.pop("think", None)
-        resp = httpx.post(url, json=payload, timeout=45.0)
+        resp = httpx.post(url, json=payload, timeout=180.0)
     resp.raise_for_status()
     data = resp.json()
     msg = data.get("message") or {}
     content = msg.get("content") or data.get("response") or msg.get("thinking") or "{}"
     return json.loads(_extract_json_text(content))
+
+
+def _compact_segments(segments: List[Dict[str, Any]], target_sec: float = 18.0) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    cur: Dict[str, Any] | None = None
+    for seg in segments:
+        txt = str(seg.get("text", "")).strip()
+        if not txt:
+            continue
+        start, end = float(seg["start"]), float(seg["end"])
+        if cur is None:
+            cur = {"start": start, "end": end, "text": txt}
+        elif start - cur["end"] <= 2.0 and end - cur["start"] <= target_sec and len(cur["text"]) + len(txt) < 340:
+            cur["end"] = max(cur["end"], end)
+            cur["text"] = f"{cur['text']} {txt}"
+        else:
+            blocks.append(cur)
+            cur = {"start": start, "end": end, "text": txt}
+    if cur is not None:
+        blocks.append(cur)
+    return blocks
 
 
 def _is_rate_limit_or_missing_key(exc: Exception) -> bool:
@@ -84,30 +105,44 @@ def select_clips_gemini(
     use_ollama = settings.ai_provider == "ollama_only" or not settings.gemini_api_key
     client = genai.Client(api_key=settings.gemini_api_key) if not use_ollama else None
 
-    segments = transcript.get("segments", [])
-    chunk_size = 100
-    overlap = 12
+    raw_segments = transcript.get("segments", [])
+    segments = _compact_segments(raw_segments) if use_ollama else raw_segments
+    chunk_size = 18 if use_ollama else 100
+    overlap = 2 if use_ollama else 12
+    chunks: List[List[Dict[str, Any]]] = []
+    idx = 0
+    while idx < max(1, len(segments)):
+        chunks.append(segments[idx : idx + chunk_size])
+        if idx + chunk_size >= len(segments):
+            break
+        idx += max(1, chunk_size - overlap)
+
+    if use_ollama and len(chunks) > 10:
+        step = len(chunks) / 10.0
+        chunks = [chunks[min(len(chunks) - 1, int(i * step))] for i in range(10)]
+
     candidates: List[Dict[str, Any]] = []
     notes: List[str] = []
     used_provider = f"Ollama ({settings.ollama_model})" if use_ollama else f"Gemini ({settings.gemini_model})"
 
-    idx = 0
-    while idx < max(1, len(segments)):
-        chunk = segments[idx : idx + chunk_size]
+    for chunk in chunks:
         formatted = "\n".join(
-            f"[{s['start']:.2f} - {s['end']:.2f}] {s['text']}" for s in chunk
+            f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in chunk
         )
         prompt = (
-            f"Source duration: {video_duration:.2f}s. Select standout standalone short-form clips "
+            f"Source duration: {video_duration:.1f}s. Select standout standalone short-form clips "
             f"between {min_duration}s and {max_duration}s. Focus: {instructions or 'Best viral moments'}.\n"
-            f"Scene cuts: {scenes[:40]}\n"
+            f"Scene cuts: {scenes[:20]}\n"
             f"Return JSON with clips array and notes.\n\n{formatted}"
         )
 
+        parsed: Dict[str, Any] = {}
         if use_ollama:
-            parsed = _call_ollama_json(prompt)
+            try:
+                parsed = _call_ollama_json(prompt)
+            except Exception as exc:
+                notes.append(f"Window skipped ({str(exc)[:80]}).")
         else:
-            parsed = {}
             for attempt in range(3):
                 try:
                     assert client is not None
@@ -124,7 +159,10 @@ def select_clips_gemini(
                     if settings.ai_provider == "gemini_with_ollama_fallback" and _is_rate_limit_or_missing_key(exc):
                         use_ollama = True
                         used_provider = f"Ollama Fallback ({settings.ollama_model})"
-                        parsed = _call_ollama_json(prompt)
+                        try:
+                            parsed = _call_ollama_json(prompt)
+                        except Exception as o_exc:
+                            notes.append(f"Ollama fallback skipped ({str(o_exc)[:80]}).")
                         break
                     if attempt == 2:
                         raise
@@ -133,10 +171,6 @@ def select_clips_gemini(
         candidates.extend(parsed.get("clips", []))
         if parsed.get("notes"):
             notes.append(parsed["notes"])
-
-        if idx + chunk_size >= len(segments):
-            break
-        idx += chunk_size - overlap
 
     valid: List[Dict[str, Any]] = []
     for c in candidates:
