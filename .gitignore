@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+storage/
+*.db
+*.db-shm
+*.db-wal
+.venv/
+.venv-whisper/
+__pycache__/
+*.pyc

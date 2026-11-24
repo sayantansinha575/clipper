@@ -1,7 +1,31 @@
 #!/usr/bin/env python3
 import json
+import subprocess
 import sys
+import numpy as np
 from faster_whisper import WhisperModel
+
+
+def load_audio_ffmpeg(audio_path: str, sample_rate: int = 16000) -> np.ndarray:
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-threads",
+        "0",
+        "-i",
+        audio_path,
+        "-f",
+        "s16le",
+        "-ac",
+        "1",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        str(sample_rate),
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=True)
+    return np.frombuffer(proc.stdout, np.int16).flatten().astype(np.float32) / 32768.0
 
 
 def main() -> int:
@@ -20,6 +44,20 @@ def main() -> int:
 
     lang_arg = None if not language_raw or language_raw == "auto" else language_raw
 
+    print("STATUS:Decoding 16kHz PCM audio via FFmpeg...", flush=True)
+    waveform = load_audio_ffmpeg(audio_path, 16000)
+    if waveform.size == 0:
+        payload = {
+            "language": lang_arg or "en",
+            "duration": round(duration_hint, 3),
+            "hasSpeech": False,
+            "segments": [],
+        }
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print("PROGRESS:100", flush=True)
+        return 0
+
     print(f"STATUS:Loading Whisper {model_size} ({device}/{compute_type}, {cpu_threads} threads)...", flush=True)
     model = WhisperModel(
         model_size,
@@ -29,14 +67,14 @@ def main() -> int:
     )
 
     segments_iter, info = model.transcribe(
-        audio_path,
+        waveform,
         language=lang_arg,
         word_timestamps=True,
         vad_filter=True,
         beam_size=3,
     )
 
-    total_duration = float(getattr(info, "duration", 0.0) or duration_hint or 1.0)
+    total_duration = float(getattr(info, "duration", 0.0) or (waveform.size / 16000.0) or duration_hint or 1.0)
     segments = []
     last_pct = -1
 

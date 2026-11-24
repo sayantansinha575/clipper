@@ -66,7 +66,7 @@ export function findWhisperPython(): string | null {
     try {
       execFileSync(bin, ['-c', 'import faster_whisper'], {
         stdio: 'ignore',
-        timeout: 5000,
+        timeout: 12000,
       });
       return bin;
     } catch {
@@ -245,6 +245,7 @@ export async function transcribeVideoAudio(params: {
       } catch (err) {
         if (isCancelled?.()) throw err;
         const msg = err instanceof Error ? err.message : String(err);
+        console.error('[transcriber] Local faster-whisper error:', msg);
         onProgress?.(34, `Local Whisper failed (${msg.slice(0, 70)}); continuing without captions...`);
       }
     } else {

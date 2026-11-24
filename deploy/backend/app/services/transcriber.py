@@ -1,8 +1,35 @@
+import subprocess
 from typing import Any, Dict, List, Optional
+import numpy as np
 from faster_whisper import WhisperModel
 from ..config import settings
 
 _whisper_instance: Optional[WhisperModel] = None
+
+
+def _load_audio_ffmpeg(audio_path: str, sample_rate: int = 16000) -> np.ndarray:
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-threads",
+            "0",
+            "-i",
+            audio_path,
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(sample_rate),
+            "-",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return np.frombuffer(proc.stdout, np.int16).flatten().astype(np.float32) / 32768.0
 
 
 def get_whisper_model() -> WhisperModel:
@@ -21,9 +48,17 @@ def get_whisper_model() -> WhisperModel:
 def transcribe_audio_file(audio_path: str, duration: float, language: Optional[str] = None) -> Dict[str, Any]:
     model = get_whisper_model()
     lang_arg = None if not language or language == "auto" else language
+    waveform = _load_audio_ffmpeg(audio_path, 16000)
+    if waveform.size == 0:
+        return {
+            "language": lang_arg or "en",
+            "duration": duration,
+            "hasSpeech": False,
+            "segments": [],
+        }
 
     segments_iter, info = model.transcribe(
-        audio_path,
+        waveform,
         language=lang_arg,
         word_timestamps=True,
         vad_filter=True,

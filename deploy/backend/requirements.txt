@@ -4,6 +4,7 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 python-multipart==0.0.20
 faster-whisper==1.1.1
+requests>=2.31.0
 scenedetect[opencv]==0.6.5.2
 opencv-python-headless==4.10.0.84
 google-genai==1.5.0
