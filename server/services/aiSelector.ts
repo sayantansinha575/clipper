@@ -71,6 +71,7 @@ async function selectChunkWithOllama(params: {
   ollamaBaseUrl: string;
   ollamaModel: string;
   prompt: string;
+  isCancelled?: () => boolean;
 }): Promise<{ clips?: RawCandidateClip[]; notes?: string }> {
   const systemPrompt = [
     'You are a short-form video editor. Return ONLY valid JSON matching this exact structure:',
@@ -78,17 +79,14 @@ async function selectChunkWithOllama(params: {
     'Rules: start and end must be numbers in seconds, start < end, never fabricate dialogue.',
   ].join('\n');
 
-  return withRetry(
-    () =>
-      generateOllamaJson<{ clips?: RawCandidateClip[]; notes?: string }>({
-        baseUrl: params.ollamaBaseUrl,
-        model: params.ollamaModel,
-        systemPrompt,
-        userPrompt: params.prompt,
-      }),
-    2,
-    800
-  );
+  return generateOllamaJson<{ clips?: RawCandidateClip[]; notes?: string }>({
+    baseUrl: params.ollamaBaseUrl,
+    model: params.ollamaModel,
+    systemPrompt,
+    userPrompt: params.prompt,
+    timeoutMs: 45_000,
+    isCancelled: params.isCancelled,
+  });
 }
 
 function buildSceneFallbackClips(
@@ -297,10 +295,20 @@ export async function selectClipsWithGemini(params: {
         ollamaBaseUrl: aiSettings.ollamaBaseUrl,
         ollamaModel: aiSettings.ollamaModel,
         prompt: scenePrompt,
+        isCancelled,
       });
       rawClips = ollamaRes.clips || [];
       notes = ollamaRes.notes || '';
-    } catch {
+      onProgress?.(54, `Ollama (${aiSettings.ollamaModel}) selected ${rawClips.length} candidate clip(s).`);
+    } catch (ollamaErr) {
+      if (isCancelled?.()) {
+        throw new Error('Job cancelled by user');
+      }
+      const errMsg = ollamaErr instanceof Error ? ollamaErr.message : String(ollamaErr);
+      onProgress?.(
+        54,
+        `Ollama skipped (${errMsg.slice(0, 60)}); using visual scene boundaries...`
+      );
       rawClips = [];
     }
 
@@ -313,7 +321,7 @@ export async function selectClipsWithGemini(params: {
         desiredCount,
         config.selectionFocus
       );
-      notes = `Generated ${rawClips.length} scene-aligned clip(s) without Gemini API.`;
+      notes = `Generated ${rawClips.length} scene-aligned clip(s) without cloud LLM.`;
     }
 
     const validated = validateClipTimestamps(
@@ -431,6 +439,7 @@ export async function selectClipsWithGemini(params: {
             ollamaBaseUrl: aiSettings.ollamaBaseUrl,
             ollamaModel: aiSettings.ollamaModel,
             prompt,
+            isCancelled,
           });
         } else {
           throw err;
@@ -441,6 +450,7 @@ export async function selectClipsWithGemini(params: {
         ollamaBaseUrl: aiSettings.ollamaBaseUrl,
         ollamaModel: aiSettings.ollamaModel,
         prompt,
+        isCancelled,
       });
     }
 

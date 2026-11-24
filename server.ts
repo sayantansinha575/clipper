@@ -221,9 +221,17 @@ async function startServer(): Promise<void> {
 
       try {
         const meta = await probeVideo(file.path);
+        const decodedOriginalName = (() => {
+          try {
+            const utf8 = Buffer.from(file.originalname, 'latin1').toString('utf8');
+            return utf8 && !utf8.includes('\uFFFD') ? utf8 : file.originalname;
+          } catch {
+            return file.originalname;
+          }
+        })();
         const videoRecord: VideoRecord = {
           id: `vid_${crypto.randomUUID().slice(0, 12)}`,
-          originalFilename: path.basename(file.originalname),
+          originalFilename: path.basename(decodedOriginalName),
           safeFilename: file.filename,
           filePath: file.path,
           fileSize: file.size,

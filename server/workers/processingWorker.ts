@@ -205,6 +205,7 @@ async function processSingleJob(jobId: string): Promise<void> {
         duration: video.duration,
         hasAudio: video.hasAudio,
         languageHint: settings.whisper.language,
+        whisperSettings: settings.whisper,
         skipCloudStt: settings.ai.provider === 'ollama_only',
         allowSkipOnQuotaOrLocalOnly: settings.ai.provider !== 'gemini_only',
         onProgress: (pct, message) => {

@@ -1,8 +1,9 @@
 import { Type } from '@google/genai';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { DIRS } from '../config.ts';
-import type { TranscriptData, TranscriptSegment, TranscriptWord } from '../types.ts';
+import type { AppSettings, TranscriptData, TranscriptSegment, TranscriptWord } from '../types.ts';
 import { cleanupJobTempFiles } from '../utils/cleanup.ts';
 import { getGeminiClient, withRetry } from '../utils/geminiClient.ts';
 import { extractAudioTrack, sliceAudioChunk } from './audioExtractor.ts';
@@ -49,12 +50,153 @@ function alignWordTimings(
   });
 }
 
+export function findWhisperPython(): string | null {
+  const candidates = [
+    process.env.WHISPER_PYTHON || '',
+    path.resolve(process.cwd(), '.venv-whisper', 'bin', 'python'),
+    path.resolve(process.cwd(), 'deploy', 'backend', '.venv', 'bin', 'python'),
+    'python3',
+    'python',
+  ].filter(Boolean);
+
+  for (const bin of candidates) {
+    if (bin.includes(path.sep) && !fs.existsSync(bin)) {
+      continue;
+    }
+    try {
+      execFileSync(bin, ['-c', 'import faster_whisper'], {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      return bin;
+    } catch {
+      // Try next candidate
+    }
+  }
+  return null;
+}
+
+async function transcribeWithLocalWhisper(params: {
+  pythonBin: string;
+  videoPath: string;
+  jobId: string;
+  duration: number;
+  transcriptPath: string;
+  whisperSettings?: AppSettings['whisper'];
+  onProgress?: (pct: number, message: string) => void;
+  isCancelled?: () => boolean;
+}): Promise<TranscriptData> {
+  const {
+    pythonBin,
+    videoPath,
+    jobId,
+    duration,
+    transcriptPath,
+    whisperSettings,
+    onProgress,
+    isCancelled,
+  } = params;
+
+  const scriptPath = path.resolve(process.cwd(), 'server', 'scripts', 'whisper_transcribe.py');
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error('Local whisper transcription script is missing.');
+  }
+
+  onProgress?.(16, 'Extracting mono audio track for local Whisper transcription...');
+  const audioPath = await extractAudioTrack(videoPath, jobId);
+
+  const modelSize = whisperSettings?.modelSize || 'small';
+  const device = whisperSettings?.device || 'cpu';
+  const computeType = whisperSettings?.computeType || 'int8';
+  const cpuThreads = String(whisperSettings?.cpuThreads || 4);
+  const language = whisperSettings?.language || 'auto';
+
+  try {
+    onProgress?.(19, `Running local faster-whisper (${modelSize}, ${computeType})...`);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(pythonBin, [
+        scriptPath,
+        audioPath,
+        transcriptPath,
+        modelSize,
+        device,
+        computeType,
+        cpuThreads,
+        language,
+        String(duration),
+      ]);
+
+      let stderrTail = '';
+      const cancelPoll = setInterval(() => {
+        if (isCancelled?.()) {
+          child.kill('SIGTERM');
+          clearInterval(cancelPoll);
+          reject(new Error('Job cancelled by user'));
+        }
+      }, 400);
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        const lines = chunk.toString('utf-8').split(/\r?\n/);
+        for (const line of lines) {
+          if (line.startsWith('STATUS:')) {
+            onProgress?.(20, line.slice(7).trim());
+          } else if (line.startsWith('PROGRESS:')) {
+            const p = Number(line.slice(9).trim());
+            if (Number.isFinite(p)) {
+              const mapped = 20 + Math.round((Math.max(0, Math.min(100, p)) / 100) * 17);
+              onProgress?.(mapped, `Local Whisper transcribing speech (${p}%)...`);
+            }
+          }
+        }
+      });
+
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderrTail = (stderrTail + chunk.toString('utf-8')).slice(-1500);
+      });
+
+      child.on('error', (err) => {
+        clearInterval(cancelPoll);
+        reject(err);
+      });
+
+      child.on('close', (code) => {
+        clearInterval(cancelPoll);
+        if (code === 0 && fs.existsSync(transcriptPath)) {
+          resolve();
+        } else {
+          reject(new Error(`faster-whisper exited with code ${code}: ${stderrTail.trim()}`));
+        }
+      });
+    });
+
+    const raw = JSON.parse(fs.readFileSync(transcriptPath, 'utf-8')) as TranscriptData;
+    const normalizedSegments: TranscriptSegment[] = (raw.segments || []).map((seg) => ({
+      start: Number(seg.start),
+      end: Number(seg.end),
+      text: (seg.text || '').trim(),
+      words: alignWordTimings(Number(seg.start), Number(seg.end), seg.text || '', seg.words),
+    }));
+
+    const normalized: TranscriptData = {
+      language: raw.language || (language !== 'auto' ? language : 'en'),
+      duration: raw.duration || duration,
+      hasSpeech: normalizedSegments.length > 0,
+      segments: normalizedSegments,
+    };
+    fs.writeFileSync(transcriptPath, JSON.stringify(normalized, null, 2), 'utf-8');
+    return normalized;
+  } finally {
+    cleanupJobTempFiles(jobId);
+  }
+}
+
 export async function transcribeVideoAudio(params: {
   videoPath: string;
   jobId: string;
   duration: number;
   hasAudio: boolean;
   languageHint?: string;
+  whisperSettings?: AppSettings['whisper'];
   skipCloudStt?: boolean;
   allowSkipOnQuotaOrLocalOnly?: boolean;
   onProgress?: (pct: number, message: string) => void;
@@ -66,6 +208,7 @@ export async function transcribeVideoAudio(params: {
     duration,
     hasAudio,
     languageHint,
+    whisperSettings,
     skipCloudStt = false,
     allowSkipOnQuotaOrLocalOnly = false,
     onProgress,
@@ -85,10 +228,31 @@ export async function transcribeVideoAudio(params: {
   }
 
   if (skipCloudStt) {
-    onProgress?.(
-      34,
-      'Local Ollama mode active; skipping Gemini cloud STT and proceeding with scene + Ollama selection...'
-    );
+    const whisperPython = findWhisperPython();
+    if (whisperPython) {
+      try {
+        const transcript = await transcribeWithLocalWhisper({
+          pythonBin: whisperPython,
+          videoPath,
+          jobId,
+          duration,
+          transcriptPath,
+          whisperSettings,
+          onProgress,
+          isCancelled,
+        });
+        return { transcript, transcriptPath };
+      } catch (err) {
+        if (isCancelled?.()) throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        onProgress?.(34, `Local Whisper failed (${msg.slice(0, 70)}); continuing without captions...`);
+      }
+    } else {
+      onProgress?.(
+        34,
+        'Local faster-whisper not installed; run ./deploy/scripts/install-whisper.sh to enable captions in Ollama-only mode.'
+      );
+    }
     const localTranscript: TranscriptData = {
       language: languageHint && languageHint !== 'auto' ? languageHint : 'en',
       duration,
@@ -104,9 +268,23 @@ export async function transcribeVideoAudio(params: {
     ai = getGeminiClient();
   } catch (err) {
     if (allowSkipOnQuotaOrLocalOnly) {
+      const whisperPython = findWhisperPython();
+      if (whisperPython) {
+        const transcript = await transcribeWithLocalWhisper({
+          pythonBin: whisperPython,
+          videoPath,
+          jobId,
+          duration,
+          transcriptPath,
+          whisperSettings,
+          onProgress,
+          isCancelled,
+        });
+        return { transcript, transcriptPath };
+      }
       onProgress?.(
         30,
-        'No Gemini API key; skipping cloud STT and switching to local scene/Ollama mode...'
+        'No Gemini API key and faster-whisper not installed; switching to scene-only mode...'
       );
       const fallbackTranscript: TranscriptData = {
         language: languageHint && languageHint !== 'auto' ? languageHint : 'en',
@@ -127,6 +305,7 @@ export async function transcribeVideoAudio(params: {
   const allSegments: TranscriptSegment[] = [];
   let detectedLanguage = languageHint && languageHint !== 'auto' ? languageHint : 'en';
 
+  let fallbackToWhisper = false;
   try {
     for (let i = 0; i < totalChunks; i++) {
       if (isCancelled?.()) {
@@ -250,9 +429,10 @@ export async function transcribeVideoAudio(params: {
             msg.includes('resource_exhausted') ||
             msg.includes('quota'))
         ) {
+          fallbackToWhisper = allSegments.length === 0;
           onProgress?.(
             34,
-            'Gemini STT unavailable/rate-limited; continuing with scene & Ollama fallback...'
+            'Gemini STT unavailable/rate-limited; switching to local Whisper / scene fallback...'
           );
           break;
         }
@@ -292,6 +472,23 @@ export async function transcribeVideoAudio(params: {
   } finally {
     // Automatic cleanup of intermediate audio files to protect disk space
     cleanupJobTempFiles(jobId);
+  }
+
+  if (fallbackToWhisper) {
+    const whisperPython = findWhisperPython();
+    if (whisperPython) {
+      const transcript = await transcribeWithLocalWhisper({
+        pythonBin: whisperPython,
+        videoPath,
+        jobId,
+        duration,
+        transcriptPath,
+        whisperSettings,
+        onProgress,
+        isCancelled,
+      });
+      return { transcript, transcriptPath };
+    }
   }
 
   allSegments.sort((a, b) => a.start - b.start);

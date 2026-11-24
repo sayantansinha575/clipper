@@ -25,8 +25,9 @@ def _call_ollama_json(prompt: str) -> Dict[str, Any]:
     payload = {
         "model": settings.ollama_model,
         "stream": False,
+        "think": False,
         "format": "json",
-        "options": {"temperature": 0.2, "num_ctx": 8192},
+        "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": 1200},
         "messages": [
             {
                 "role": "system",
@@ -39,10 +40,14 @@ def _call_ollama_json(prompt: str) -> Dict[str, Any]:
             {"role": "user", "content": prompt},
         ],
     }
-    resp = httpx.post(url, json=payload, timeout=120.0)
+    resp = httpx.post(url, json=payload, timeout=45.0)
+    if resp.status_code == 400 and "think" in resp.text.lower():
+        payload.pop("think", None)
+        resp = httpx.post(url, json=payload, timeout=45.0)
     resp.raise_for_status()
     data = resp.json()
-    content = (data.get("message") or {}).get("content") or data.get("response") or "{}"
+    msg = data.get("message") or {}
+    content = msg.get("content") or data.get("response") or msg.get("thinking") or "{}"
     return json.loads(_extract_json_text(content))
 
 

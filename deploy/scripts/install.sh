@@ -25,7 +25,14 @@ cd "${APP_DIR}"
 npm ci || npm install
 npm run build
 
-# 2. Optional: Python virtual environment for standalone FastAPI/faster-whisper worker
+# 2. Install lightweight CPU faster-whisper for local word-level subtitles & captions (~200 MB)
+if [ "${SKIP_WHISPER_INSTALL:-0}" != "1" ]; then
+  if [ -f "${APP_DIR}/deploy/scripts/install-whisper.sh" ]; then
+    "${APP_DIR}/deploy/scripts/install-whisper.sh" || echo "Warning: faster-whisper install failed (install python3-venv and run ./deploy/scripts/install-whisper.sh)"
+  fi
+fi
+
+# 3. Optional: Python virtual environment for standalone FastAPI worker
 if [ "${INSTALL_PYTHON_WORKER:-0}" = "1" ] && [ -d "${APP_DIR}/deploy/backend" ]; then
   python3 -m venv "${APP_DIR}/deploy/backend/.venv"
   "${APP_DIR}/deploy/backend/.venv/bin/pip" install --upgrade pip

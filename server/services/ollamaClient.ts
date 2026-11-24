@@ -86,26 +86,63 @@ export async function generateOllamaJson<T>(params: {
   model: string;
   systemPrompt: string;
   userPrompt: string;
+  timeoutMs?: number;
+  isCancelled?: () => boolean;
 }): Promise<T> {
   const cleanUrl = normalizeOllamaBaseUrl(params.baseUrl);
-  const res = await fetch(`${cleanUrl}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal: AbortSignal.timeout(120_000),
-    body: JSON.stringify({
-      model: params.model,
-      stream: false,
-      format: 'json',
-      options: {
-        temperature: 0.2,
-        num_ctx: 8192,
-      },
-      messages: [
-        { role: 'system', content: params.systemPrompt },
-        { role: 'user', content: params.userPrompt },
-      ],
-    }),
-  });
+  const timeoutMs = params.timeoutMs ?? 45_000;
+
+  const sendChatRequest = async (includeThinkFlag: boolean): Promise<Response> => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(new Error('Ollama request timed out')), timeoutMs);
+    const cancelPollId = params.isCancelled
+      ? setInterval(() => {
+          if (params.isCancelled?.()) {
+            controller.abort(new Error('Job cancelled by user'));
+          }
+        }, 400)
+      : null;
+
+    try {
+      const payload: Record<string, unknown> = {
+        model: params.model,
+        stream: false,
+        format: 'json',
+        options: {
+          temperature: 0.2,
+          num_ctx: 4096,
+          num_predict: 1200,
+        },
+        messages: [
+          { role: 'system', content: params.systemPrompt },
+          { role: 'user', content: params.userPrompt },
+        ],
+      };
+      if (includeThinkFlag) {
+        payload.think = false;
+      }
+
+      return await fetch(`${cleanUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify(payload),
+      });
+    } finally {
+      clearTimeout(timeoutId);
+      if (cancelPollId) clearInterval(cancelPollId);
+    }
+  };
+
+  let res = await sendChatRequest(true);
+  if (res.status === 400) {
+    const errText = await res.text().catch(() => '');
+    if (errText.toLowerCase().includes('think')) {
+      res = await sendChatRequest(false);
+    } else {
+      throw new Error(`Ollama error (400): ${errText.slice(0, 300)}`);
+    }
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -113,10 +150,10 @@ export async function generateOllamaJson<T>(params: {
   }
 
   const data = (await res.json()) as {
-    message?: { content?: string };
+    message?: { content?: string; thinking?: string };
     response?: string;
   };
-  const content = data.message?.content ?? data.response ?? '';
+  const content = data.message?.content ?? data.response ?? data.message?.thinking ?? '';
   if (!content.trim()) {
     throw new Error('Ollama returned an empty response.');
   }
