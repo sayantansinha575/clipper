@@ -26,6 +26,7 @@ import type {
   JobConfig,
   OutputResolution,
   SelectionFocus,
+  SplitRegion,
   VideoItem,
 } from '../types';
 
@@ -48,6 +49,15 @@ const FOCUS_OPTIONS: Array<{ id: SelectionFocus; label: string }> = [
   { id: 'motivational', label: 'Motivational' },
   { id: 'podcast_highlights', label: 'Podcast highlights' },
   { id: 'custom', label: 'Custom instructions' },
+];
+
+const SPLIT_REGION_PRESETS: Array<{ label: string; region: SplitRegion }> = [
+  { label: 'Middle-Left', region: { x: 0.01, y: 0.23, w: 0.22, h: 0.32 } },
+  { label: 'Top-Left', region: { x: 0.01, y: 0.02, w: 0.25, h: 0.34 } },
+  { label: 'Top-Right', region: { x: 0.74, y: 0.02, w: 0.25, h: 0.34 } },
+  { label: 'Bottom-Left', region: { x: 0.01, y: 0.64, w: 0.25, h: 0.34 } },
+  { label: 'Bottom-Right', region: { x: 0.74, y: 0.64, w: 0.25, h: 0.34 } },
+  { label: 'Top Center', region: { x: 0.25, y: 0.02, w: 0.5, h: 0.44 } },
 ];
 
 export function CreateShortsView({
@@ -88,7 +98,15 @@ export function CreateShortsView({
   const [outputResolution, setOutputResolution] = useState<OutputResolution>(
     settings?.video.defaultResolution || '1080x1920'
   );
-  const [cropMode, setCropMode] = useState<CropMode>('blurred_bg');
+  const [cropMode, setCropMode] = useState<CropMode>('center');
+  const [splitTopRegion, setSplitTopRegion] = useState<SplitRegion>({
+    x: 0.01,
+    y: 0.23,
+    w: 0.22,
+    h: 0.32,
+  });
+  const [splitTopRatio, setSplitTopRatio] = useState<number>(0.4);
+  const [previewFailed, setPreviewFailed] = useState<boolean>(false);
   const [selectionFocus, setSelectionFocus] = useState<SelectionFocus>('best_moments');
   const [customInstructions, setCustomInstructions] = useState<string>(
     settings?.ai.defaultInstructions || ''
@@ -108,6 +126,7 @@ export function CreateShortsView({
     try {
       const res = await uploadVideoWithProgress(file, (pct) => setUploadPct(pct));
       setSelectedVideo(res.video);
+      setPreviewFailed(false);
       onVideoUploaded(res.video);
       // Adjust default min/max duration sensibly if user uploads a short test video
       if (res.video.duration > 0 && res.video.duration < 20) {
@@ -150,6 +169,8 @@ export function CreateShortsView({
         captionStyle: styleBase,
         effects: {
           cropMode,
+          splitTopRegion: cropMode === 'split_screen' ? splitTopRegion : undefined,
+          splitTopRatio: cropMode === 'split_screen' ? splitTopRatio : undefined,
           subtleZoomIn,
           zoomOut,
           fadeInOut,
@@ -352,6 +373,7 @@ export function CreateShortsView({
                   onChange={(e) => {
                     const found = videos.find((v) => v.id === e.target.value) || null;
                     setSelectedVideo(found);
+                    setPreviewFailed(false);
                   }}
                   className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
                 >
@@ -576,9 +598,10 @@ export function CreateShortsView({
                 onChange={(e) => setCropMode(e.target.value as CropMode)}
                 className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
               >
-                <option value="blurred_bg">Blurred Background + Foreground</option>
-                <option value="center">Center Crop</option>
+                <option value="center">Center Crop (Full Frame)</option>
+                <option value="split_screen">Split Screen (Top + Bottom)</option>
                 <option value="subject_aware">Subject-Aware Framing</option>
+                <option value="blurred_bg">Blurred Background + Foreground</option>
               </select>
             </div>
 
@@ -599,6 +622,139 @@ export function CreateShortsView({
               </select>
             </div>
           </div>
+
+          {cropMode === 'split_screen' && (
+            <div className="p-4 rounded-xl bg-[#09090B] border border-zinc-800 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-medium text-[#FAFAFA]">
+                    Split Screen — Top Panel Region
+                  </div>
+                  <div className="text-[11px] text-[#A1A1AA]">
+                    Click on the preview frame or pick a preset for the top section; the bottom section uses the full center view.
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {SPLIT_REGION_PRESETS.map((preset) => (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      onClick={() => setSplitTopRegion(preset.region)}
+                      className="px-2 py-1 rounded border border-zinc-800 bg-zinc-900 hover:border-[#8B5CF6] text-[11px] text-[#FAFAFA] transition-colors"
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
+                <div className="md:col-span-7">
+                  <div
+                    className="relative w-full aspect-video rounded-lg overflow-hidden bg-zinc-950 border border-zinc-800 cursor-crosshair select-none"
+                    onClick={(e) => {
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const clickX = (e.clientX - rect.left) / rect.width;
+                      const clickY = (e.clientY - rect.top) / rect.height;
+                      setSplitTopRegion((prev) => ({
+                        ...prev,
+                        x: Number(Math.min(1 - prev.w, Math.max(0, clickX - prev.w / 2)).toFixed(3)),
+                        y: Number(Math.min(1 - prev.h, Math.max(0, clickY - prev.h / 2)).toFixed(3)),
+                      }));
+                    }}
+                  >
+                    {selectedVideo && !previewFailed ? (
+                      <img
+                        key={selectedVideo.id}
+                        src={`/api/videos/${selectedVideo.id}/preview-frame`}
+                        alt="Video frame preview"
+                        onError={() => setPreviewFailed(true)}
+                        className="w-full h-full object-fill pointer-events-none"
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-xs text-[#A1A1AA]">
+                        {selectedVideo ? 'Frame preview unavailable' : 'Select or upload a video to preview'}
+                      </div>
+                    )}
+                    <div
+                      className="absolute border-2 border-[#8B5CF6] bg-[#8B5CF6]/20 pointer-events-none rounded-sm"
+                      style={{
+                        left: `${splitTopRegion.x * 100}%`,
+                        top: `${splitTopRegion.y * 100}%`,
+                        width: `${splitTopRegion.w * 100}%`,
+                        height: `${splitTopRegion.h * 100}%`,
+                      }}
+                    >
+                      <span className="inline-block px-1.5 py-0.5 bg-[#8B5CF6] text-[10px] font-medium text-white">
+                        Top
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="md:col-span-5 space-y-2.5 text-xs">
+                  <div>
+                    <div className="flex justify-between text-[#A1A1AA] mb-1">
+                      <span>Box Width</span>
+                      <span className="font-mono text-[#FAFAFA]">{Math.round(splitTopRegion.w * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={12}
+                      max={80}
+                      value={Math.round(splitTopRegion.w * 100)}
+                      onChange={(e) => {
+                        const w = Number(e.target.value) / 100;
+                        setSplitTopRegion((prev) => ({
+                          ...prev,
+                          w,
+                          x: Number(Math.min(prev.x, 1 - w).toFixed(3)),
+                        }));
+                      }}
+                      className="w-full accent-[#8B5CF6]"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-[#A1A1AA] mb-1">
+                      <span>Box Height</span>
+                      <span className="font-mono text-[#FAFAFA]">{Math.round(splitTopRegion.h * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={15}
+                      max={80}
+                      value={Math.round(splitTopRegion.h * 100)}
+                      onChange={(e) => {
+                        const h = Number(e.target.value) / 100;
+                        setSplitTopRegion((prev) => ({
+                          ...prev,
+                          h,
+                          y: Number(Math.min(prev.y, 1 - h).toFixed(3)),
+                        }));
+                      }}
+                      className="w-full accent-[#8B5CF6]"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-[#A1A1AA] mb-1">
+                      <span>Top Panel Split</span>
+                      <span className="font-mono text-[#FAFAFA]">
+                        {Math.round(splitTopRatio * 100)}% / {Math.round((1 - splitTopRatio) * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={30}
+                      max={55}
+                      value={Math.round(splitTopRatio * 100)}
+                      onChange={(e) => setSplitTopRatio(Number(e.target.value) / 100)}
+                      className="w-full accent-[#8B5CF6]"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           <div>
             <label className="block text-xs font-medium text-[#A1A1AA] mb-1.5">

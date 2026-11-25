@@ -121,6 +121,32 @@ export async function renderClipWithFfmpeg(params: {
     if (hasAudio) {
       args.push('-map', '0:a:0?');
     }
+  } else if (effects.cropMode === 'split_screen') {
+    const ratio = Math.min(0.65, Math.max(0.25, Number(effects.splitTopRatio ?? 0.4)));
+    const topH = Math.max(64, Math.floor((targetH * ratio) / 2) * 2);
+    const bottomH = Math.max(64, targetH - topH);
+
+    const reg = effects.splitTopRegion || { x: 0.01, y: 0.23, w: 0.22, h: 0.32 };
+    const rw = Math.min(1, Math.max(0.08, Number(reg.w) || 0.22));
+    const rh = Math.min(1, Math.max(0.08, Number(reg.h) || 0.32));
+    const rx = Math.min(1 - rw, Math.max(0, Number(reg.x) || 0));
+    const ry = Math.min(1 - rh, Math.max(0, Number(reg.y) || 0));
+
+    const cropW = `max(32,trunc(iw*${rw.toFixed(4)}/2)*2)`;
+    const cropH = `max(32,trunc(ih*${rh.toFixed(4)}/2)*2)`;
+    const cropX = `min(iw-ow,max(0,trunc(iw*${rx.toFixed(4)})))`;
+    const cropY = `min(ih-oh,max(0,trunc(ih*${ry.toFixed(4)})))`;
+
+    const filterComplex = [
+      `[0:v]split=2[topsrc][botsrc]`,
+      `[topsrc]crop=w='${cropW}':h='${cropH}':x='${cropX}':y='${cropY}',scale=${targetW}:${topH}:force_original_aspect_ratio=increase,crop=${targetW}:${topH}:(iw-ow)/2:(ih-oh)/2,setsar=1[topout]`,
+      `[botsrc]scale=${targetW}:${bottomH}:force_original_aspect_ratio=increase,crop=${targetW}:${bottomH}:(iw-ow)/2:(ih-oh)/2,setsar=1[botout]`,
+      `[topout][botout]vstack=inputs=2,${postChain}[vout]`,
+    ].join(';');
+    args.push('-filter_complex', filterComplex, '-map', '[vout]');
+    if (hasAudio) {
+      args.push('-map', '0:a:0?');
+    }
   } else {
     // Center crop or subject-aware (slightly higher vertical framing for talking heads)
     const yExpr = effects.cropMode === 'subject_aware' ? '(ih-oh)*0.32' : '(ih-oh)/2';

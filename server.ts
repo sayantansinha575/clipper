@@ -33,6 +33,7 @@ import {
   updateClip,
   updateJob,
 } from './server/db.ts';
+import { extractVideoFrame } from './server/services/audioExtractor.ts';
 import { generateClipSubtitles, getInstalledFonts } from './server/services/captionGenerator.ts';
 import {
   normalizeOllamaBaseUrl,
@@ -273,6 +274,29 @@ async function startServer(): Promise<void> {
     res.json({ video: serializeVideo(video) });
   });
 
+  app.get('/api/videos/:id/preview-frame', async (req, res) => {
+    const video = getVideoById(req.params.id);
+    if (!video || !fs.existsSync(video.filePath)) {
+      res.status(404).json({ error: 'Source video not found.' });
+      return;
+    }
+    const previewPath = path.join(DIRS.thumbnails, `${video.id}_preview.jpg`);
+    try {
+      if (!fs.existsSync(previewPath)) {
+        const ts = video.duration > 6 ? Math.min(8, video.duration * 0.15) : Math.max(0.2, video.duration * 0.3);
+        await extractVideoFrame(video.filePath, ts, previewPath);
+      }
+      if (!fs.existsSync(previewPath)) {
+        res.status(404).json({ error: 'Could not extract preview frame.' });
+        return;
+      }
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.type('image/jpeg').sendFile(previewPath);
+    } catch {
+      res.status(500).json({ error: 'Failed to extract preview frame.' });
+    }
+  });
+
   app.delete('/api/videos/:id', requireAdminIfConfigured, (req, res) => {
     const video = getVideoById(req.params.id);
     if (!video) {
@@ -294,6 +318,7 @@ async function startServer(): Promise<void> {
       removeFileIfExists(job.zipPath);
     }
 
+    removeFileIfExists(path.join(DIRS.thumbnails, `${video.id}_preview.jpg`));
     removeFileIfExists(video.filePath);
     deleteVideoById(video.id);
     res.json({ deleted: true, id: video.id });
@@ -355,11 +380,18 @@ async function startServer(): Promise<void> {
     const presetKey = (rawCfg.captionStyle?.preset || settings.caption.preset) as CaptionPresetId;
     const basePreset = CAPTION_PRESETS[presetKey] || settings.caption;
 
-    const cropMode: CropMode = (['center', 'blurred_bg', 'subject_aware'] as CropMode[]).includes(
-      rawCfg.effects?.cropMode as CropMode
-    )
+    const cropMode: CropMode = (
+      ['center', 'split_screen', 'blurred_bg', 'subject_aware'] as CropMode[]
+    ).includes(rawCfg.effects?.cropMode as CropMode)
       ? (rawCfg.effects?.cropMode as CropMode)
-      : 'blurred_bg';
+      : 'center';
+
+    const rawReg = rawCfg.effects?.splitTopRegion;
+    const clampedW = Math.min(1, Math.max(0.08, Number(rawReg?.w ?? 0.22) || 0.22));
+    const clampedH = Math.min(1, Math.max(0.08, Number(rawReg?.h ?? 0.32) || 0.32));
+    const clampedX = Math.min(1 - clampedW, Math.max(0, Number(rawReg?.x ?? 0.01) || 0));
+    const clampedY = Math.min(1 - clampedH, Math.max(0, Number(rawReg?.y ?? 0.23) || 0));
+    const splitTopRatio = Math.min(0.65, Math.max(0.25, Number(rawCfg.effects?.splitTopRatio ?? 0.4) || 0.4));
 
     const jobConfig: JobConfig = {
       clipCount,
@@ -378,6 +410,16 @@ async function startServer(): Promise<void> {
       },
       effects: {
         cropMode,
+        splitTopRegion:
+          cropMode === 'split_screen'
+            ? {
+                x: Number(clampedX.toFixed(4)),
+                y: Number(clampedY.toFixed(4)),
+                w: Number(clampedW.toFixed(4)),
+                h: Number(clampedH.toFixed(4)),
+              }
+            : undefined,
+        splitTopRatio: cropMode === 'split_screen' ? Number(splitTopRatio.toFixed(2)) : undefined,
         subtleZoomIn: Boolean(rawCfg.effects?.subtleZoomIn),
         zoomOut: Boolean(rawCfg.effects?.zoomOut),
         fadeInOut: Boolean(rawCfg.effects?.fadeInOut ?? true),

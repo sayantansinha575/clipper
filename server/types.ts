@@ -1,6 +1,6 @@
 export type AspectRatio = '9:16' | '1:1' | '16:9';
 export type OutputResolution = '1080x1920' | '720x1280' | '1080x1080' | '1920x1080';
-export type CropMode = 'center' | 'blurred_bg' | 'subject_aware';
+export type CropMode = 'center' | 'split_screen' | 'blurred_bg' | 'subject_aware';
 export type SelectionFocus =
   | 'best_moments'
   | 'educational'
@@ -69,8 +69,17 @@ export interface CaptionStyleConfig {
   uppercase: boolean;
 }
 
+export interface SplitRegion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface EffectsConfig {
   cropMode: CropMode;
+  splitTopRegion?: SplitRegion;
+  splitTopRatio?: number;
   subtleZoomIn: boolean;
   zoomOut: boolean;
   fadeInOut: boolean;
