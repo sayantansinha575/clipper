@@ -257,6 +257,40 @@ test('renderClipWithFfmpeg renders 9:16 vertical MP4 with ASS subtitles and vali
   assert.ok(zip.fileSize > 1000);
 });
 
+test('renderClipWithFfmpeg renders full-frame 9:16 split_screen MP4 cleanly', async () => {
+  const assPath = path.join(DIRS.subtitles, 'test_clip_01.ass');
+  const rendered = await renderClipWithFfmpeg({
+    jobId: 'test_job_split',
+    clipId: 'test_clip_split',
+    sourcePath: TEST_VIDEO,
+    startTime: 0.2,
+    endTime: 3.0,
+    hasAudio: true,
+    aspectRatio: '9:16',
+    outputResolution: '720x1280',
+    effects: {
+      cropMode: 'split_screen',
+      splitTopRegion: { x: 0.01, y: 0.23, w: 0.22, h: 0.32 },
+      splitTopRatio: 0.4,
+      subtleZoomIn: false,
+      zoomOut: false,
+      fadeInOut: false,
+      audioNormalize: false,
+    },
+    assPath,
+    fps: 30,
+    crf: 24,
+    preset: 'ultrafast',
+    audioBitrate: '128k',
+  });
+
+  GENERATED_FILES.push(rendered.outputPath);
+  const validation = await validateRenderedVideo(rendered.outputPath);
+  assert.equal(validation.valid, true);
+  assert.equal(validation.metadata?.width, 720);
+  assert.equal(validation.metadata?.height, 1280);
+});
+
 test('Ollama JSON stripping, URL normalization, and rate-limit error detection', async () => {
   assert.equal(normalizeOllamaBaseUrl('http://10.190.0.4:11434/'), 'http://10.190.0.4:11434');
   assert.throws(() => normalizeOllamaBaseUrl('ftp://bad-host'));
