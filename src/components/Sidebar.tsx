@@ -2,6 +2,7 @@ import {
   Captions,
   Film,
   FolderKanban,
+  HardDrive,
   LayoutDashboard,
   ListChecks,
   PlusSquare,
@@ -25,6 +26,7 @@ const NAV_ITEMS: Array<{
 }> = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'create', label: 'Create Shorts', icon: PlusSquare },
+  { id: 'raw_videos', label: 'Raw Videos', icon: HardDrive },
   { id: 'projects', label: 'Projects', icon: FolderKanban },
   { id: 'clips', label: 'Generated Clips', icon: Film },
   { id: 'captions', label: 'Caption Styles', icon: Captions },

@@ -33,7 +33,7 @@ import {
   updateClip,
   updateJob,
 } from './server/db.ts';
-import { extractVideoFrame } from './server/services/audioExtractor.ts';
+import { extractVideoFilmstrip, extractVideoFrame } from './server/services/audioExtractor.ts';
 import { generateClipSubtitles, getInstalledFonts } from './server/services/captionGenerator.ts';
 import {
   normalizeOllamaBaseUrl,
@@ -49,9 +49,11 @@ import type {
   CaptionPresetId,
   ClipRecord,
   CropMode,
+  JobClipMode,
   JobConfig,
   JobRecord,
   OutputResolution,
+  PortionRange,
   SelectionFocus,
   TranscriptData,
   VideoRecord,
@@ -297,6 +299,37 @@ async function startServer(): Promise<void> {
     }
   });
 
+  app.get('/api/videos/:id/filmstrip', async (req, res) => {
+    const video = getVideoById(req.params.id);
+    if (!video || !fs.existsSync(video.filePath)) {
+      res.status(404).json({ error: 'Source video not found.' });
+      return;
+    }
+    const stripPath = path.join(DIRS.thumbnails, `${video.id}_filmstrip.jpg`);
+    try {
+      if (!fs.existsSync(stripPath)) {
+        await extractVideoFilmstrip(video.filePath, video.duration, stripPath, 8);
+      }
+      if (!fs.existsSync(stripPath)) {
+        res.status(404).json({ error: 'Could not extract filmstrip.' });
+        return;
+      }
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.type('image/jpeg').sendFile(stripPath);
+    } catch {
+      res.status(500).json({ error: 'Failed to generate video filmstrip.' });
+    }
+  });
+
+  app.get('/api/videos/:id/stream', (req, res) => {
+    const video = getVideoById(req.params.id);
+    if (!video || !fs.existsSync(video.filePath)) {
+      res.status(404).json({ error: 'Source video not found.' });
+      return;
+    }
+    res.sendFile(path.resolve(video.filePath));
+  });
+
   app.delete('/api/videos/:id', requireAdminIfConfigured, (req, res) => {
     const video = getVideoById(req.params.id);
     if (!video) {
@@ -319,6 +352,7 @@ async function startServer(): Promise<void> {
     }
 
     removeFileIfExists(path.join(DIRS.thumbnails, `${video.id}_preview.jpg`));
+    removeFileIfExists(path.join(DIRS.thumbnails, `${video.id}_filmstrip.jpg`));
     removeFileIfExists(video.filePath);
     deleteVideoById(video.id);
     res.json({ deleted: true, id: video.id });
@@ -345,12 +379,38 @@ async function startServer(): Promise<void> {
     const settings = getSettings();
     const rawCfg = body.config || {};
 
-    const clipCount = Math.max(
-      1,
-      Math.min(settings.ai.maxClips || 50, Number(rawCfg.clipCount ?? 15))
-    );
-    const minDuration = Math.max(3, Math.min(180, Number(rawCfg.minDuration ?? 20)));
-    const maxDuration = Math.max(minDuration, Math.min(300, Number(rawCfg.maxDuration ?? 60)));
+    const clipMode: JobClipMode = (
+      ['auto_ai', 'portion_single', 'portion_multi'] as JobClipMode[]
+    ).includes(rawCfg.clipMode as JobClipMode)
+      ? (rawCfg.clipMode as JobClipMode)
+      : 'auto_ai';
+
+    let portionRange: PortionRange | undefined;
+    if (clipMode !== 'auto_ai') {
+      const pStart = Math.max(0, Number(rawCfg.portionRange?.start ?? 0));
+      const pEnd = Math.min(video.duration, Number(rawCfg.portionRange?.end ?? video.duration));
+      if (!Number.isFinite(pStart) || !Number.isFinite(pEnd) || pEnd - pStart < 1) {
+        res.status(400).json({ error: 'Selected portion must be at least 1 second long.' });
+        return;
+      }
+      portionRange = {
+        start: Number(pStart.toFixed(2)),
+        end: Number(pEnd.toFixed(2)),
+      };
+    }
+
+    const clipCount =
+      clipMode === 'portion_single'
+        ? 1
+        : Math.max(1, Math.min(settings.ai.maxClips || 50, Number(rawCfg.clipCount ?? 15)));
+    const minDuration =
+      clipMode === 'portion_single' && portionRange
+        ? Math.max(1, Number((portionRange.end - portionRange.start).toFixed(2)))
+        : Math.max(3, Math.min(180, Number(rawCfg.minDuration ?? 20)));
+    const maxDuration =
+      clipMode === 'portion_single' && portionRange
+        ? minDuration
+        : Math.max(minDuration, Math.min(300, Number(rawCfg.maxDuration ?? 60)));
     const aspectRatio: AspectRatio = (['9:16', '1:1', '16:9'] as AspectRatio[]).includes(
       rawCfg.aspectRatio as AspectRatio
     )
@@ -394,6 +454,8 @@ async function startServer(): Promise<void> {
     const splitTopRatio = Math.min(0.65, Math.max(0.25, Number(rawCfg.effects?.splitTopRatio ?? 0.4) || 0.4));
 
     const jobConfig: JobConfig = {
+      clipMode,
+      portionRange,
       clipCount,
       minDuration,
       maxDuration,

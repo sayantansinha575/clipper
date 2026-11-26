@@ -1,6 +1,7 @@
 export type NavSection =
   | 'dashboard'
   | 'create'
+  | 'raw_videos'
   | 'projects'
   | 'clips'
   | 'captions'
@@ -10,6 +11,7 @@ export type NavSection =
 export type AspectRatio = '9:16' | '1:1' | '16:9';
 export type OutputResolution = '1080x1920' | '720x1280' | '1080x1080' | '1920x1080';
 export type CropMode = 'center' | 'split_screen' | 'blurred_bg' | 'subject_aware';
+export type JobClipMode = 'auto_ai' | 'portion_single' | 'portion_multi';
 export type SelectionFocus =
   | 'best_moments'
   | 'educational'
@@ -73,7 +75,14 @@ export interface EffectsConfig {
   audioNormalize: boolean;
 }
 
+export interface PortionRange {
+  start: number;
+  end: number;
+}
+
 export interface JobConfig {
+  clipMode?: JobClipMode;
+  portionRange?: PortionRange;
   clipCount: number;
   minDuration: number;
   maxDuration: number;

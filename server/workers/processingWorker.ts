@@ -167,22 +167,46 @@ async function processSingleJob(jobId: string): Promise<void> {
   }
 
   try {
+    const clipMode = job.config.clipMode || 'auto_ai';
+    const portionRange = job.config.portionRange;
+    const hasPortion =
+      (clipMode === 'portion_single' || clipMode === 'portion_multi') &&
+      Boolean(portionRange) &&
+      Number(portionRange!.end) > Number(portionRange!.start);
+    const rangeStart = hasPortion ? Math.max(0, Number(portionRange!.start)) : undefined;
+    const rangeEnd = hasPortion
+      ? Math.min(video.duration, Number(portionRange!.end))
+      : undefined;
+
     // 1. Analyzing (Scene detection + metadata check)
-    updateAndEmit(jobId, {
-      status: 'analyzing',
-      progressPct: 6,
-      stageMessage: 'Inspecting video streams and detecting visual scene boundaries...',
-      errorMessage: null,
-    });
+    let scenes: number[] = [];
+    if (clipMode === 'portion_single') {
+      updateAndEmit(jobId, {
+        status: 'analyzing',
+        progressPct: 14,
+        scenes: [],
+        stageMessage: `Preparing selected portion (${rangeStart?.toFixed(1)}s–${rangeEnd?.toFixed(1)}s)...`,
+        errorMessage: null,
+      });
+    } else {
+      updateAndEmit(jobId, {
+        status: 'analyzing',
+        progressPct: 6,
+        stageMessage: hasPortion
+          ? `Scanning scene transitions inside ${rangeStart?.toFixed(1)}s–${rangeEnd?.toFixed(1)}s...`
+          : 'Inspecting video streams and detecting visual scene boundaries...',
+        errorMessage: null,
+      });
 
-    const scenes = await detectSceneChanges(video.filePath);
-    if (isCancelled(jobId)) return;
+      scenes = await detectSceneChanges(video.filePath, 0.32, 400, rangeStart, rangeEnd);
+      if (isCancelled(jobId)) return;
 
-    updateAndEmit(jobId, {
-      scenes,
-      progressPct: 14,
-      stageMessage: `Detected ${scenes.length} visual scene transition(s).`,
-    });
+      updateAndEmit(jobId, {
+        scenes,
+        progressPct: 14,
+        stageMessage: `Detected ${scenes.length} visual scene transition(s).`,
+      });
+    }
 
     // 2. Transcribing
     let transcript: TranscriptData;
@@ -195,7 +219,9 @@ async function processSingleJob(jobId: string): Promise<void> {
         status: 'transcribing',
         progressPct: 16,
         stageMessage: video.hasAudio
-          ? 'Extracting audio and transcribing speech with word timestamps...'
+          ? hasPortion
+            ? `Transcribing selected portion (${rangeStart?.toFixed(1)}s–${rangeEnd?.toFixed(1)}s)...`
+            : 'Extracting audio and transcribing speech with word timestamps...'
           : 'No audio track detected; preparing visual frame analysis...',
       });
 
@@ -204,6 +230,8 @@ async function processSingleJob(jobId: string): Promise<void> {
         jobId,
         duration: video.duration,
         hasAudio: video.hasAudio,
+        rangeStart,
+        rangeEnd,
         languageHint: settings.whisper.language,
         whisperSettings: settings.whisper,
         skipCloudStt: settings.ai.provider === 'ollama_only',
@@ -229,30 +257,111 @@ async function processSingleJob(jobId: string): Promise<void> {
         : 'Proceeding with visual highlight selection.',
     });
 
-    // 3. Selecting clips with Gemini (reuse existing clips if recovering mid-render)
+    // 3. Selecting clips (reuse existing clips if recovering mid-render)
     let clips = listClipsByJob(jobId);
     if (clips.length === 0) {
-      updateAndEmit(jobId, {
-        status: 'selecting_clips',
-        progressPct: 40,
-        stageMessage: 'Selecting high-retention clips with Gemini AI...',
-      });
+      let selected: Array<{
+        start: number;
+        end: number;
+        duration: number;
+        title: string;
+        hook: string;
+        reason: string;
+        category: string;
+        score: number;
+      }> = [];
+      let aiNotes = '';
 
-      const { clips: selected, aiNotes } = await selectClipsWithGemini({
-        videoPath: video.filePath,
-        jobId,
-        videoDuration: video.duration,
-        transcript,
-        scenes,
-        config: job.config,
-        aiSettings: settings.ai,
-        onProgress: (pct, message) => {
-          if (!isCancelled(jobId)) {
-            updateAndEmit(jobId, { progressPct: pct, stageMessage: message });
-          }
-        },
-        isCancelled: () => isCancelled(jobId),
-      });
+      if (clipMode === 'portion_single' && hasPortion && rangeStart !== undefined && rangeEnd !== undefined) {
+        const span = Number(Math.max(0.5, rangeEnd - rangeStart).toFixed(2));
+        const firstLine = transcript.segments[0]?.text?.trim().slice(0, 90) || '';
+        selected = [
+          {
+            start: Number(rangeStart.toFixed(2)),
+            end: Number(rangeEnd.toFixed(2)),
+            duration: span,
+            title: `Selected Clip (${rangeStart.toFixed(0)}s–${rangeEnd.toFixed(0)}s)`,
+            hook: firstLine || `Manual clip from ${rangeStart.toFixed(1)}s to ${rangeEnd.toFixed(1)}s`,
+            reason: 'Direct conversion of user-selected video portion.',
+            category: job.config.selectionFocus,
+            score: 100,
+          },
+        ];
+        aiNotes = `[Manual Portion] Direct single-clip conversion (${rangeStart.toFixed(1)}s–${rangeEnd.toFixed(1)}s).`;
+      } else if (clipMode === 'portion_multi' && hasPortion && rangeStart !== undefined && rangeEnd !== undefined) {
+        updateAndEmit(jobId, {
+          status: 'selecting_clips',
+          progressPct: 40,
+          stageMessage: `Selecting clips inside ${rangeStart.toFixed(1)}s–${rangeEnd.toFixed(1)}s...`,
+        });
+
+        const portionDur = Math.max(1, rangeEnd - rangeStart);
+        const shiftedTranscript: TranscriptData = {
+          language: transcript.language,
+          duration: portionDur,
+          hasSpeech: transcript.hasSpeech,
+          segments: transcript.segments
+            .filter((s) => s.end > rangeStart && s.start < rangeEnd)
+            .map((s) => ({
+              start: Number(Math.max(0, s.start - rangeStart).toFixed(3)),
+              end: Number(Math.min(portionDur, s.end - rangeStart).toFixed(3)),
+              text: s.text,
+              words: s.words.map((w) => ({
+                word: w.word,
+                start: Number(Math.max(0, w.start - rangeStart).toFixed(3)),
+                end: Number(Math.min(portionDur, w.end - rangeStart).toFixed(3)),
+              })),
+            })),
+        };
+
+        const aiRes = await selectClipsWithGemini({
+          videoPath: video.filePath,
+          jobId,
+          videoDuration: portionDur,
+          transcript: shiftedTranscript,
+          scenes,
+          config: job.config,
+          aiSettings: settings.ai,
+          onProgress: (pct, message) => {
+            if (!isCancelled(jobId)) {
+              updateAndEmit(jobId, { progressPct: pct, stageMessage: message });
+            }
+          },
+          isCancelled: () => isCancelled(jobId),
+        });
+
+        selected = aiRes.clips.map((c) => ({
+          ...c,
+          start: Number((c.start + rangeStart).toFixed(2)),
+          end: Number(Math.min(rangeEnd, c.end + rangeStart).toFixed(2)),
+          duration: Number((Math.min(rangeEnd, c.end + rangeStart) - (c.start + rangeStart)).toFixed(2)),
+        }));
+        aiNotes = `[Portion ${rangeStart.toFixed(0)}s–${rangeEnd.toFixed(0)}s] ${aiRes.aiNotes}`;
+      } else {
+        updateAndEmit(jobId, {
+          status: 'selecting_clips',
+          progressPct: 40,
+          stageMessage: 'Selecting high-retention clips with AI...',
+        });
+
+        const aiRes = await selectClipsWithGemini({
+          videoPath: video.filePath,
+          jobId,
+          videoDuration: video.duration,
+          transcript,
+          scenes,
+          config: job.config,
+          aiSettings: settings.ai,
+          onProgress: (pct, message) => {
+            if (!isCancelled(jobId)) {
+              updateAndEmit(jobId, { progressPct: pct, stageMessage: message });
+            }
+          },
+          isCancelled: () => isCancelled(jobId),
+        });
+        selected = aiRes.clips;
+        aiNotes = aiRes.aiNotes;
+      }
 
       if (isCancelled(jobId)) return;
 

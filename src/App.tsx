@@ -6,6 +6,7 @@ import { CreateShortsView } from './components/CreateShortsView';
 import { DashboardView } from './components/DashboardView';
 import { ProjectsView } from './components/ProjectsView';
 import { QueueView } from './components/QueueView';
+import { RawVideosView } from './components/RawVideosView';
 import { SettingsView } from './components/SettingsView';
 import { Sidebar } from './components/Sidebar';
 import { api } from './lib/api';
@@ -22,6 +23,7 @@ import type {
 const SECTION_TITLES: Record<NavSection, string> = {
   dashboard: 'Dashboard',
   create: 'Create Shorts',
+  raw_videos: 'Raw Videos',
   projects: 'Projects',
   clips: 'Generated Clips',
   captions: 'Caption Styles',
@@ -42,6 +44,7 @@ export default function App() {
 
   const [selectedJobFilter, setSelectedJobFilter] = useState<string>('all');
   const [preselectedVideoId, setPreselectedVideoId] = useState<string | null>(null);
+  const [createInitialMode, setCreateInitialMode] = useState<'auto_ai' | 'portion'>('auto_ai');
   const [cleaningStorage, setCleaningStorage] = useState(false);
 
   const refreshAll = useCallback(async () => {
@@ -192,6 +195,7 @@ export default function App() {
               videos={videos}
               settings={settings}
               initialVideoId={preselectedVideoId}
+              initialMode={createInitialMode}
               onSettingsSaved={setSettings}
               onVideoUploaded={(video) => {
                 setVideos((prev) => [video, ...prev.filter((v) => v.id !== video.id)]);
@@ -204,12 +208,31 @@ export default function App() {
             />
           )}
 
+          {activeSection === 'raw_videos' && (
+            <RawVideosView
+              videos={videos}
+              jobs={jobs}
+              onAutoClipsFromVideo={(videoId) => {
+                setPreselectedVideoId(videoId);
+                setCreateInitialMode('auto_ai');
+                setActiveSection('create');
+              }}
+              onPortionClipFromVideo={(videoId) => {
+                setPreselectedVideoId(videoId);
+                setCreateInitialMode('portion');
+                setActiveSection('create');
+              }}
+              onRefresh={refreshAll}
+            />
+          )}
+
           {activeSection === 'projects' && (
             <ProjectsView
               videos={videos}
               jobs={jobs}
               onCreateFromVideo={(videoId) => {
                 setPreselectedVideoId(videoId);
+                setCreateInitialMode('auto_ai');
                 setActiveSection('create');
               }}
               onViewJobClips={(jobId) => {

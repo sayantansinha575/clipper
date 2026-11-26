@@ -5,6 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import test from 'node:test';
 import { CAPTION_PRESETS, DIRS, ensureStorageDirectories } from '../server/config.ts';
+import { extractAudioTrack, extractVideoFilmstrip } from '../server/services/audioExtractor.ts';
 import { isRateLimitOrFallbackError, selectClipsWithGemini } from '../server/services/aiSelector.ts';
 import { generateClipSubtitles } from '../server/services/captionGenerator.ts';
 import { extractJsonFromLlmText, normalizeOllamaBaseUrl } from '../server/services/ollamaClient.ts';
@@ -54,6 +55,19 @@ test('probeVideo extracts real FFprobe stream metadata', async () => {
   assert.ok(meta.duration >= 5.5 && meta.duration <= 6.5);
   assert.equal(meta.hasAudio, true);
   assert.equal(meta.videoCodec, 'h264');
+});
+
+test('extractVideoFilmstrip and range-bounded extractAudioTrack succeed', async () => {
+  const stripPath = path.join(DIRS.temp, 'test_filmstrip.jpg');
+  await extractVideoFilmstrip(TEST_VIDEO, 6.0, stripPath, 6);
+  GENERATED_FILES.push(stripPath);
+  assert.equal(fs.existsSync(stripPath), true);
+  assert.ok(fs.statSync(stripPath).size > 2000);
+
+  const rangeAudio = await extractAudioTrack(TEST_VIDEO, 'test_range_job', 1.0, 4.0);
+  GENERATED_FILES.push(rangeAudio);
+  assert.equal(fs.existsSync(rangeAudio), true);
+  assert.ok(fs.statSync(rangeAudio).size > 1000);
 });
 
 test('detectSceneChanges runs without error', async () => {

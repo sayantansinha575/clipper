@@ -1,13 +1,17 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   AlertCircle,
   Check,
   Cpu,
   FileVideo,
+  Layers,
   Loader2,
   Play,
+  Scissors,
   Sliders,
+  Sparkles,
   Upload,
+  Volume2,
   X,
 } from 'lucide-react';
 import { api, uploadVideoWithProgress } from '../lib/api';
@@ -34,6 +38,7 @@ interface CreateShortsViewProps {
   videos: VideoItem[];
   settings: AppSettings | null;
   initialVideoId?: string | null;
+  initialMode?: 'auto_ai' | 'portion';
   onSettingsSaved: (updated: AppSettings) => void;
   onVideoUploaded: (video: VideoItem) => void;
   onJobStarted: (jobId: string) => void;
@@ -64,16 +69,25 @@ export function CreateShortsView({
   videos,
   settings,
   initialVideoId,
+  initialMode = 'auto_ai',
   onSettingsSaved,
   onVideoUploaded,
   onJobStarted,
 }: CreateShortsViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const portionVideoRef = useRef<HTMLVideoElement | null>(null);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  const [workspaceMode, setWorkspaceMode] = useState<'auto_ai' | 'portion'>(initialMode);
+  const [portionOutputMode, setPortionOutputMode] = useState<'single' | 'multi'>('single');
+  const [draggingHandle, setDraggingHandle] = useState<'start' | 'end' | null>(null);
+  const [currentPlayTime, setCurrentPlayTime] = useState<number>(0);
+  const [previewPlayingPortion, setPreviewPlayingPortion] = useState<boolean>(false);
 
   const [showAiSetupModal, setShowAiSetupModal] = useState(false);
   const [ollamaUrlDraft, setOllamaUrlDraft] = useState<string>(
@@ -89,6 +103,26 @@ export function CreateShortsView({
   const [selectedVideo, setSelectedVideo] = useState<VideoItem | null>(
     () => videos.find((v) => v.id === initialVideoId) || videos[0] || null
   );
+  const [portionStart, setPortionStart] = useState<number>(0);
+  const [portionEnd, setPortionEnd] = useState<number>(() => {
+    const v = videos.find((x) => x.id === initialVideoId) || videos[0];
+    if (!v) return 30;
+    return v.duration > 90 ? 60 : Number(v.duration.toFixed(1));
+  });
+
+  useEffect(() => {
+    setWorkspaceMode(initialMode);
+  }, [initialMode]);
+
+  useEffect(() => {
+    if (initialVideoId && selectedVideo?.id !== initialVideoId) {
+      const found = videos.find((v) => v.id === initialVideoId);
+      if (found) {
+        selectSourceVideo(found);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialVideoId]);
 
   const [clipCount, setClipCount] = useState<number>(10);
   const [customCountMode, setCustomCountMode] = useState<boolean>(false);
@@ -119,14 +153,24 @@ export function CreateShortsView({
   const [fadeInOut, setFadeInOut] = useState<boolean>(true);
   const [audioNormalize, setAudioNormalize] = useState<boolean>(true);
 
+  const selectSourceVideo = (vid: VideoItem | null) => {
+    setSelectedVideo(vid);
+    setPreviewFailed(false);
+    setPreviewPlayingPortion(false);
+    setCurrentPlayTime(0);
+    if (vid) {
+      setPortionStart(0);
+      setPortionEnd(vid.duration > 90 ? 60 : Number(vid.duration.toFixed(1)));
+    }
+  };
+
   const handleFileSelected = async (file: File) => {
     setErrorMsg(null);
     setUploading(true);
     setUploadPct(0);
     try {
       const res = await uploadVideoWithProgress(file, (pct) => setUploadPct(pct));
-      setSelectedVideo(res.video);
-      setPreviewFailed(false);
+      selectSourceVideo(res.video);
       onVideoUploaded(res.video);
       // Adjust default min/max duration sensibly if user uploads a short test video
       if (res.video.duration > 0 && res.video.duration < 20) {
@@ -158,10 +202,31 @@ export function CreateShortsView({
           ? settings.caption
           : FRONTEND_CAPTION_PRESETS[captionPreset];
 
+      const effectiveClipMode =
+        workspaceMode === 'portion'
+          ? portionOutputMode === 'single'
+            ? 'portion_single'
+            : 'portion_multi'
+          : 'auto_ai';
+
       const config: JobConfig = {
-        clipCount: Math.max(1, Math.min(50, clipCount)),
-        minDuration: Math.max(3, minDuration),
-        maxDuration: Math.max(minDuration, maxDuration),
+        clipMode: effectiveClipMode,
+        portionRange:
+          workspaceMode === 'portion'
+            ? {
+                start: Number(Math.max(0, portionStart).toFixed(2)),
+                end: Number(Math.min(selectedVideo.duration, portionEnd).toFixed(2)),
+              }
+            : undefined,
+        clipCount: effectiveClipMode === 'portion_single' ? 1 : Math.max(1, Math.min(50, clipCount)),
+        minDuration:
+          effectiveClipMode === 'portion_single'
+            ? Math.max(1, Number((portionEnd - portionStart).toFixed(2)))
+            : Math.max(3, minDuration),
+        maxDuration:
+          effectiveClipMode === 'portion_single'
+            ? Math.max(1, Number((portionEnd - portionStart).toFixed(2)))
+            : Math.max(minDuration, maxDuration),
         aspectRatio,
         outputResolution,
         selectionFocus,
@@ -193,12 +258,18 @@ export function CreateShortsView({
       return;
     }
 
+    if (workspaceMode === 'portion' && portionEnd - portionStart < 1) {
+      setErrorMsg('Selected video portion must be at least 1 second long.');
+      return;
+    }
+
     setErrorMsg(null);
+    const needsAiSelection = !(workspaceMode === 'portion' && portionOutputMode === 'single');
     const hasGemini = Boolean(settings?.ai.geminiKeyConfigured);
     const mode = settings?.ai.provider || 'gemini_with_ollama_fallback';
 
-    // Pre-flight check when deploying with no host Gemini key or in Ollama-only mode
-    if ((mode === 'gemini_only' && !hasGemini) || !hasGemini || mode === 'ollama_only') {
+    // Pre-flight check only when AI clip selection is used
+    if (needsAiSelection && ((mode === 'gemini_only' && !hasGemini) || !hasGemini || mode === 'ollama_only')) {
       if (mode === 'gemini_only' && !hasGemini) {
         setOllamaUrlDraft(settings?.ai.ollamaBaseUrl || 'http://127.0.0.1:11434');
         setOllamaModelDraft(settings?.ai.ollamaModel || 'qwen3.5:4b');
@@ -269,16 +340,66 @@ export function CreateShortsView({
     await submitProcessingJob();
   };
 
+  const updateTimelineFromPointer = (clientX: number, targetHandle: 'start' | 'end') => {
+    if (!selectedVideo || !timelineRef.current) return;
+    const rect = timelineRef.current.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / Math.max(1, rect.width)));
+    const sec = Number((ratio * selectedVideo.duration).toFixed(1));
+    if (targetHandle === 'start') {
+      const clamped = Math.min(sec, Math.max(0, portionEnd - 1));
+      setPortionStart(clamped);
+      if (portionVideoRef.current) portionVideoRef.current.currentTime = clamped;
+    } else {
+      const clamped = Math.max(sec, Math.min(selectedVideo.duration, portionStart + 1));
+      setPortionEnd(clamped);
+      if (portionVideoRef.current) portionVideoRef.current.currentTime = clamped;
+    }
+  };
+
+  const handleTimelinePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!draggingHandle) return;
+    updateTimelineFromPointer(e.clientX, draggingHandle);
+  };
+
   return (
     <div className="space-y-8">
-      <div>
-        <h1 className="font-display text-2xl font-semibold tracking-tight text-[#FAFAFA]">
-          Create Shorts
-        </h1>
-        <p className="text-sm text-[#A1A1AA] mt-1">
-          Upload a long-form video, inspect real FFprobe stream metadata, and configure AI clipping
-          and FFmpeg rendering.
-        </p>
+      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+        <div>
+          <h1 className="font-display text-2xl font-semibold tracking-tight text-[#FAFAFA]">
+            Create Shorts
+          </h1>
+          <p className="text-sm text-[#A1A1AA] mt-1">
+            Upload or reuse a stored raw video, choose automatic full-video AI shorts or trim a specific portion.
+          </p>
+        </div>
+
+        {/* Mode Switcher: AI Auto Shorts vs Separate Select Portion & Clip */}
+        <div className="inline-flex p-1 rounded-xl bg-[#18181B] border border-zinc-800 self-start">
+          <button
+            type="button"
+            onClick={() => setWorkspaceMode('auto_ai')}
+            className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+              workspaceMode === 'auto_ai'
+                ? 'bg-[#8B5CF6] text-white'
+                : 'text-[#A1A1AA] hover:text-[#FAFAFA]'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            AI Auto Shorts
+          </button>
+          <button
+            type="button"
+            onClick={() => setWorkspaceMode('portion')}
+            className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+              workspaceMode === 'portion'
+                ? 'bg-[#06B6D4] text-zinc-950'
+                : 'text-[#A1A1AA] hover:text-[#FAFAFA]'
+            }`}
+          >
+            <Scissors className="w-3.5 h-3.5" />
+            Select Portion & Clip
+          </button>
+        </div>
       </div>
 
       {errorMsg && (
@@ -372,8 +493,7 @@ export function CreateShortsView({
                   value={selectedVideo?.id || ''}
                   onChange={(e) => {
                     const found = videos.find((v) => v.id === e.target.value) || null;
-                    setSelectedVideo(found);
-                    setPreviewFailed(false);
+                    selectSourceVideo(found);
                   }}
                   className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
                 >
@@ -464,84 +584,345 @@ export function CreateShortsView({
             </h2>
           </div>
 
-          {/* Number of Clips */}
-          <div>
-            <label className="block text-xs font-medium text-[#FAFAFA] mb-2">
-              Target Number of Clips (Max 50)
-            </label>
-            <div className="flex flex-wrap items-center gap-2">
-              {CLIP_COUNT_OPTIONS.map((num) => {
-                const active = !customCountMode && clipCount === num;
-                return (
+          {workspaceMode === 'portion' && (
+            <div className="p-4 rounded-xl bg-[#09090B] border border-zinc-800 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-semibold text-[#FAFAFA]">
+                    Select Video Portion (Start → End)
+                  </div>
+                  <div className="text-[11px] text-[#A1A1AA]">
+                    Drag the white handles on the filmstrip to pick the exact segment, then choose Single Clip or Multiple Clips.
+                  </div>
+                </div>
+                {selectedVideo && (
                   <button
-                    key={num}
                     type="button"
                     onClick={() => {
-                      setCustomCountMode(false);
-                      setClipCount(num);
+                      if (!portionVideoRef.current) return;
+                      portionVideoRef.current.currentTime = portionStart;
+                      setPreviewPlayingPortion(true);
+                      void portionVideoRef.current.play();
                     }}
-                    className={`px-3.5 py-2 rounded-lg font-mono tabular-nums text-xs font-medium border transition-colors ${
-                      active
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-700 hover:border-[#06B6D4] text-xs font-medium text-[#FAFAFA]"
+                  >
+                    <Play className="w-3 h-3 text-[#06B6D4]" />
+                    Preview Selection
+                  </button>
+                )}
+              </div>
+
+              {selectedVideo ? (
+                <>
+                  <div className="bg-black rounded-lg overflow-hidden border border-zinc-800">
+                    <video
+                      ref={portionVideoRef}
+                      key={selectedVideo.id}
+                      src={`/api/videos/${selectedVideo.id}/stream`}
+                      controls
+                      onTimeUpdate={(e) => {
+                        const t = e.currentTarget.currentTime;
+                        setCurrentPlayTime(t);
+                        if (previewPlayingPortion && t >= portionEnd) {
+                          e.currentTarget.pause();
+                          setPreviewPlayingPortion(false);
+                        }
+                      }}
+                      className="w-full max-h-60 mx-auto"
+                    />
+                  </div>
+
+                  {/* Visual Filmstrip Timeline Scrubber */}
+                  <div className="space-y-2">
+                    <div
+                      ref={timelineRef}
+                      onPointerMove={handleTimelinePointerMove}
+                      onPointerUp={() => setDraggingHandle(null)}
+                      onPointerCancel={() => setDraggingHandle(null)}
+                      onClick={(e) => {
+                        if (draggingHandle || !timelineRef.current || !portionVideoRef.current) return;
+                        const rect = timelineRef.current.getBoundingClientRect();
+                        const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / Math.max(1, rect.width)));
+                        portionVideoRef.current.currentTime = ratio * selectedVideo.duration;
+                      }}
+                      className="relative h-14 w-full rounded-lg overflow-hidden bg-zinc-900 border border-zinc-800 select-none touch-none cursor-pointer"
+                    >
+                      <img
+                        src={`/api/videos/${selectedVideo.id}/filmstrip`}
+                        alt="Video timeline strip"
+                        className="w-full h-full object-fill pointer-events-none"
+                        onError={(e) => {
+                          e.currentTarget.style.display = 'none';
+                        }}
+                      />
+
+                      {/* Dimmed outside-selection masks */}
+                      <div
+                        className="absolute inset-y-0 left-0 bg-black/70 pointer-events-none"
+                        style={{
+                          width: `${(portionStart / Math.max(0.1, selectedVideo.duration)) * 100}%`,
+                        }}
+                      />
+                      <div
+                        className="absolute inset-y-0 right-0 bg-black/70 pointer-events-none"
+                        style={{
+                          width: `${Math.max(
+                            0,
+                            100 - (portionEnd / Math.max(0.1, selectedVideo.duration)) * 100
+                          )}%`,
+                        }}
+                      />
+
+                      {/* Active range box + white draggable handles */}
+                      <div
+                        className="absolute inset-y-0 border-y-2 border-x-2 border-white pointer-events-none"
+                        style={{
+                          left: `${(portionStart / Math.max(0.1, selectedVideo.duration)) * 100}%`,
+                          width: `${Math.max(
+                            2,
+                            ((portionEnd - portionStart) / Math.max(0.1, selectedVideo.duration)) * 100
+                          )}%`,
+                        }}
+                      />
+
+                      {/* Playhead */}
+                      <div
+                        className="absolute inset-y-0 w-0.5 bg-[#06B6D4] pointer-events-none"
+                        style={{
+                          left: `${Math.min(
+                            100,
+                            (currentPlayTime / Math.max(0.1, selectedVideo.duration)) * 100
+                          )}%`,
+                        }}
+                      />
+
+                      {/* Left Start Handle */}
+                      <button
+                        type="button"
+                        aria-label="Drag start time"
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          setDraggingHandle('start');
+                        }}
+                        onPointerMove={(e) => {
+                          if (draggingHandle === 'start') updateTimelineFromPointer(e.clientX, 'start');
+                        }}
+                        onPointerUp={() => setDraggingHandle(null)}
+                        style={{
+                          left: `calc(${(portionStart / Math.max(0.1, selectedVideo.duration)) * 100}% - 10px)`,
+                        }}
+                        className="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-white shadow-md border-2 border-zinc-900 cursor-ew-resize z-10"
+                      />
+
+                      {/* Right End Handle */}
+                      <button
+                        type="button"
+                        aria-label="Drag end time"
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          setDraggingHandle('end');
+                        }}
+                        onPointerMove={(e) => {
+                          if (draggingHandle === 'end') updateTimelineFromPointer(e.clientX, 'end');
+                        }}
+                        onPointerUp={() => setDraggingHandle(null)}
+                        style={{
+                          left: `calc(${(portionEnd / Math.max(0.1, selectedVideo.duration)) * 100}% - 10px)`,
+                        }}
+                        className="absolute top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-white shadow-md border-2 border-zinc-900 cursor-ew-resize z-10"
+                      />
+                    </div>
+
+                    {/* Selection Duration & Size Readout + Fine Controls */}
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-xs font-mono text-[#FAFAFA] tabular-nums">
+                        <Volume2 className="w-3.5 h-3.5 text-[#06B6D4]" />
+                        <span>{formatDuration(Math.max(0, portionEnd - portionStart))}</span>
+                        <span className="text-zinc-600">•</span>
+                        <span className="text-[#A1A1AA]">
+                          ~
+                          {formatBytes(
+                            Math.round(
+                              (Math.max(0, portionEnd - portionStart) /
+                                Math.max(1, selectedVideo.duration)) *
+                                selectedVideo.fileSize
+                            )
+                          )}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-xs">
+                        <label className="text-[#A1A1AA]">Start (s)</label>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min={0}
+                          max={Math.max(0, portionEnd - 1)}
+                          value={portionStart}
+                          onChange={(e) => {
+                            const val = Math.min(
+                              Math.max(0, Number(e.target.value)),
+                              Math.max(0, portionEnd - 1)
+                            );
+                            setPortionStart(Number(val.toFixed(1)));
+                          }}
+                          className="w-20 px-2 py-1 rounded bg-zinc-950 border border-zinc-800 font-mono text-[#FAFAFA]"
+                        />
+                        <label className="text-[#A1A1AA]">End (s)</label>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min={Math.min(selectedVideo.duration, portionStart + 1)}
+                          max={selectedVideo.duration}
+                          value={portionEnd}
+                          onChange={(e) => {
+                            const val = Math.max(
+                              Math.min(selectedVideo.duration, portionStart + 1),
+                              Math.min(selectedVideo.duration, Number(e.target.value))
+                            );
+                            setPortionEnd(Number(val.toFixed(1)));
+                          }}
+                          className="w-20 px-2 py-1 rounded bg-zinc-950 border border-zinc-800 font-mono text-[#FAFAFA]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Two Output Choices: Single Clip vs Multiple Clips */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setPortionOutputMode('single')}
+                      className={`p-3 rounded-lg border text-left transition-colors ${
+                        portionOutputMode === 'single'
+                          ? 'bg-[#06B6D4]/15 border-[#06B6D4] text-[#FAFAFA]'
+                          : 'bg-zinc-950 border-zinc-800 text-[#A1A1AA] hover:text-[#FAFAFA]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 text-xs font-semibold">
+                        <Scissors className="w-3.5 h-3.5 text-[#06B6D4]" />
+                        Convert as Single Clip
+                      </div>
+                      <p className="text-[11px] text-[#A1A1AA] mt-1">
+                        Renders this exact Start → End segment as 1 vertical Short with Whisper captions (no AI wait).
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setPortionOutputMode('multi')}
+                      className={`p-3 rounded-lg border text-left transition-colors ${
+                        portionOutputMode === 'multi'
+                          ? 'bg-[#8B5CF6]/15 border-[#8B5CF6] text-[#FAFAFA]'
+                          : 'bg-zinc-950 border-zinc-800 text-[#A1A1AA] hover:text-[#FAFAFA]'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 text-xs font-semibold">
+                        <Layers className="w-3.5 h-3.5 text-[#8B5CF6]" />
+                        Create Multiple Clips (AI)
+                      </div>
+                      <p className="text-[11px] text-[#A1A1AA] mt-1">
+                        Finds multiple standout Shorts strictly inside your selected Start → End range.
+                      </p>
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="py-6 text-center text-xs text-[#A1A1AA]">
+                  Upload a video or pick an existing raw video on the left to scrub and trim a portion.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Number of Clips & Duration (shown in AI Auto Shorts OR Portion Multi-Clip) */}
+          {(workspaceMode === 'auto_ai' || portionOutputMode === 'multi') && (
+            <>
+              <div>
+                <label className="block text-xs font-medium text-[#FAFAFA] mb-2">
+                  Target Number of Clips (Max 50)
+                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  {CLIP_COUNT_OPTIONS.map((num) => {
+                    const active = !customCountMode && clipCount === num;
+                    return (
+                      <button
+                        key={num}
+                        type="button"
+                        onClick={() => {
+                          setCustomCountMode(false);
+                          setClipCount(num);
+                        }}
+                        className={`px-3.5 py-2 rounded-lg font-mono tabular-nums text-xs font-medium border transition-colors ${
+                          active
+                            ? 'bg-[#8B5CF6] border-[#8B5CF6] text-white'
+                            : 'bg-[#09090B] border-zinc-800 text-[#A1A1AA] hover:text-[#FAFAFA]'
+                        }`}
+                      >
+                        {num}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => setCustomCountMode(true)}
+                    className={`px-3.5 py-2 rounded-lg text-xs font-medium border transition-colors ${
+                      customCountMode
                         ? 'bg-[#8B5CF6] border-[#8B5CF6] text-white'
                         : 'bg-[#09090B] border-zinc-800 text-[#A1A1AA] hover:text-[#FAFAFA]'
                     }`}
                   >
-                    {num}
+                    Custom
                   </button>
-                );
-              })}
-              <button
-                type="button"
-                onClick={() => setCustomCountMode(true)}
-                className={`px-3.5 py-2 rounded-lg text-xs font-medium border transition-colors ${
-                  customCountMode
-                    ? 'bg-[#8B5CF6] border-[#8B5CF6] text-white'
-                    : 'bg-[#09090B] border-zinc-800 text-[#A1A1AA] hover:text-[#FAFAFA]'
-                }`}
-              >
-                Custom
-              </button>
-              {customCountMode && (
-                <input
-                  type="number"
-                  min={1}
-                  max={50}
-                  value={clipCount}
-                  onChange={(e) => setClipCount(Math.max(1, Math.min(50, Number(e.target.value))))}
-                  className="w-24 px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-700 font-mono tabular-nums text-xs text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
-                />
-              )}
-            </div>
-          </div>
+                  {customCountMode && (
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={clipCount}
+                      onChange={(e) => setClipCount(Math.max(1, Math.min(50, Number(e.target.value))))}
+                      className="w-24 px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-700 font-mono tabular-nums text-xs text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
+                    />
+                  )}
+                </div>
+              </div>
+            </>
+          )}
 
           {/* Clip Duration + Aspect Ratio + Resolution */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-[#A1A1AA] mb-1.5">
-                Min Duration (sec)
-              </label>
-              <input
-                type="number"
-                min={3}
-                max={180}
-                value={minDuration}
-                onChange={(e) => setMinDuration(Math.max(3, Number(e.target.value)))}
-                className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 font-mono tabular-nums text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-[#A1A1AA] mb-1.5">
-                Max Duration (sec)
-              </label>
-              <input
-                type="number"
-                min={minDuration}
-                max={300}
-                value={maxDuration}
-                onChange={(e) => setMaxDuration(Math.max(minDuration, Number(e.target.value)))}
-                className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 font-mono tabular-nums text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
-              />
-            </div>
+            {(workspaceMode === 'auto_ai' || portionOutputMode === 'multi') && (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-[#A1A1AA] mb-1.5">
+                    Min Duration (sec)
+                  </label>
+                  <input
+                    type="number"
+                    min={3}
+                    max={180}
+                    value={minDuration}
+                    onChange={(e) => setMinDuration(Math.max(3, Number(e.target.value)))}
+                    className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 font-mono tabular-nums text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-[#A1A1AA] mb-1.5">
+                    Max Duration (sec)
+                  </label>
+                  <input
+                    type="number"
+                    min={minDuration}
+                    max={300}
+                    value={maxDuration}
+                    onChange={(e) => setMaxDuration(Math.max(minDuration, Number(e.target.value)))}
+                    className="w-full px-3 py-2 rounded-lg bg-[#09090B] border border-zinc-800 font-mono tabular-nums text-sm text-[#FAFAFA] focus:outline-none focus:border-[#8B5CF6]"
+                  />
+                </div>
+              </>
+            )}
             <div>
               <label className="block text-xs font-medium text-[#A1A1AA] mb-1.5">
                 Aspect Ratio

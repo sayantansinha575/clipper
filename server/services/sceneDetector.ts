@@ -6,25 +6,35 @@ const execFileAsync = promisify(execFile);
 export async function detectSceneChanges(
   videoPath: string,
   threshold = 0.32,
-  maxScenes = 400
+  maxScenes = 400,
+  rangeStart?: number,
+  rangeEnd?: number
 ): Promise<number[]> {
   try {
     // Downscale & sample at 2fps so scene detection finishes quickly even on multi-hour videos
-    const { stderr } = await execFileAsync(
-      'ffmpeg',
-      [
-        '-i',
-        videoPath,
-        '-vf',
-        `scale=320:-2,fps=2,select='gt(scene,${threshold})',showinfo`,
-        '-vsync',
-        'vfr',
-        '-f',
-        'null',
-        '-',
-      ],
-      { maxBuffer: 25 * 1024 * 1024, timeout: 300_000 }
+    const args: string[] = ['-y'];
+    const hasRange =
+      typeof rangeStart === 'number' &&
+      typeof rangeEnd === 'number' &&
+      rangeEnd > rangeStart;
+    if (hasRange) {
+      args.push('-ss', String(Math.max(0, rangeStart!)), '-t', String(rangeEnd! - Math.max(0, rangeStart!)));
+    }
+    args.push(
+      '-i',
+      videoPath,
+      '-vf',
+      `scale=320:-2,fps=2,select='gt(scene,${threshold})',showinfo`,
+      '-vsync',
+      'vfr',
+      '-f',
+      'null',
+      '-'
     );
+    const { stderr } = await execFileAsync('ffmpeg', args, {
+      maxBuffer: 25 * 1024 * 1024,
+      timeout: 300_000,
+    });
 
     const timestamps: number[] = [];
     const regex = /pts_time:([0-9]+(?:\.[0-9]+)?)/g;

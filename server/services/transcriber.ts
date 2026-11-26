@@ -81,6 +81,8 @@ async function transcribeWithLocalWhisper(params: {
   videoPath: string;
   jobId: string;
   duration: number;
+  rangeStart?: number;
+  rangeEnd?: number;
   transcriptPath: string;
   whisperSettings?: AppSettings['whisper'];
   onProgress?: (pct: number, message: string) => void;
@@ -91,6 +93,8 @@ async function transcribeWithLocalWhisper(params: {
     videoPath,
     jobId,
     duration,
+    rangeStart,
+    rangeEnd,
     transcriptPath,
     whisperSettings,
     onProgress,
@@ -102,8 +106,20 @@ async function transcribeWithLocalWhisper(params: {
     throw new Error('Local whisper transcription script is missing.');
   }
 
+  const hasRange =
+    typeof rangeStart === 'number' &&
+    typeof rangeEnd === 'number' &&
+    rangeEnd > rangeStart;
+  const offsetStart = hasRange ? Math.max(0, rangeStart!) : 0;
+  const effectiveDuration = hasRange ? Math.max(0.5, rangeEnd! - offsetStart) : duration;
+
   onProgress?.(16, 'Extracting mono audio track for local Whisper transcription...');
-  const audioPath = await extractAudioTrack(videoPath, jobId);
+  const audioPath = await extractAudioTrack(
+    videoPath,
+    jobId,
+    hasRange ? offsetStart : undefined,
+    hasRange ? rangeEnd : undefined
+  );
 
   const modelSize = whisperSettings?.modelSize || 'small';
   const device = whisperSettings?.device || 'cpu';
@@ -123,7 +139,7 @@ async function transcribeWithLocalWhisper(params: {
         computeType,
         cpuThreads,
         language,
-        String(duration),
+        String(effectiveDuration),
       ]);
 
       let stderrTail = '';
@@ -170,16 +186,25 @@ async function transcribeWithLocalWhisper(params: {
     });
 
     const raw = JSON.parse(fs.readFileSync(transcriptPath, 'utf-8')) as TranscriptData;
-    const normalizedSegments: TranscriptSegment[] = (raw.segments || []).map((seg) => ({
-      start: Number(seg.start),
-      end: Number(seg.end),
-      text: (seg.text || '').trim(),
-      words: alignWordTimings(Number(seg.start), Number(seg.end), seg.text || '', seg.words),
-    }));
+    const normalizedSegments: TranscriptSegment[] = (raw.segments || []).map((seg) => {
+      const sStart = Number((Number(seg.start) + offsetStart).toFixed(3));
+      const sEnd = Number((Number(seg.end) + offsetStart).toFixed(3));
+      const shiftedWords = (seg.words || []).map((w) => ({
+        word: w.word,
+        start: Number(w.start) + offsetStart,
+        end: Number(w.end) + offsetStart,
+      }));
+      return {
+        start: sStart,
+        end: sEnd,
+        text: (seg.text || '').trim(),
+        words: alignWordTimings(sStart, sEnd, seg.text || '', shiftedWords),
+      };
+    });
 
     const normalized: TranscriptData = {
       language: raw.language || (language !== 'auto' ? language : 'en'),
-      duration: raw.duration || duration,
+      duration: duration || raw.duration,
       hasSpeech: normalizedSegments.length > 0,
       segments: normalizedSegments,
     };
@@ -195,6 +220,8 @@ export async function transcribeVideoAudio(params: {
   jobId: string;
   duration: number;
   hasAudio: boolean;
+  rangeStart?: number;
+  rangeEnd?: number;
   languageHint?: string;
   whisperSettings?: AppSettings['whisper'];
   skipCloudStt?: boolean;
@@ -207,6 +234,8 @@ export async function transcribeVideoAudio(params: {
     jobId,
     duration,
     hasAudio,
+    rangeStart,
+    rangeEnd,
     languageHint,
     whisperSettings,
     skipCloudStt = false,
@@ -215,8 +244,14 @@ export async function transcribeVideoAudio(params: {
     isCancelled,
   } = params;
   const transcriptPath = path.join(DIRS.subtitles, `${jobId}_transcript.json`);
+  const hasRange =
+    typeof rangeStart === 'number' &&
+    typeof rangeEnd === 'number' &&
+    rangeEnd > rangeStart;
+  const offsetStart = hasRange ? Math.max(0, rangeStart!) : 0;
+  const effectiveDuration = hasRange ? Math.max(0.5, rangeEnd! - offsetStart) : duration;
 
-  if (!hasAudio || duration <= 0) {
+  if (!hasAudio || effectiveDuration <= 0) {
     const emptyTranscript: TranscriptData = {
       language: 'none',
       duration,
@@ -236,6 +271,8 @@ export async function transcribeVideoAudio(params: {
           videoPath,
           jobId,
           duration,
+          rangeStart,
+          rangeEnd,
           transcriptPath,
           whisperSettings,
           onProgress,
@@ -276,6 +313,8 @@ export async function transcribeVideoAudio(params: {
           videoPath,
           jobId,
           duration,
+          rangeStart,
+          rangeEnd,
           transcriptPath,
           whisperSettings,
           onProgress,
@@ -300,9 +339,14 @@ export async function transcribeVideoAudio(params: {
   }
 
   onProgress?.(16, 'Extracting mono audio track for speech transcription...');
-  const audioPath = await extractAudioTrack(videoPath, jobId);
+  const audioPath = await extractAudioTrack(
+    videoPath,
+    jobId,
+    hasRange ? offsetStart : undefined,
+    hasRange ? rangeEnd : undefined
+  );
   const chunkDuration = 90; // 90 seconds per chunk keeps timestamps precise and payloads compact
-  const totalChunks = Math.max(1, Math.ceil(duration / chunkDuration));
+  const totalChunks = Math.max(1, Math.ceil(effectiveDuration / chunkDuration));
   const allSegments: TranscriptSegment[] = [];
   let detectedLanguage = languageHint && languageHint !== 'auto' ? languageHint : 'en';
 
@@ -313,7 +357,7 @@ export async function transcribeVideoAudio(params: {
         throw new Error('Job cancelled by user');
       }
       const chunkStart = i * chunkDuration;
-      const chunkLen = Math.min(chunkDuration, Math.max(0.5, duration - chunkStart));
+      const chunkLen = Math.min(chunkDuration, Math.max(0.5, effectiveDuration - chunkStart));
       if (chunkLen < 0.3) continue;
 
       onProgress?.(
@@ -449,17 +493,23 @@ export async function transcribeVideoAudio(params: {
         if (!cleanText) continue;
 
         const absStart = Number(
-          Math.max(0, Math.min(duration, chunkStart + Math.max(0, Number(seg.start) || 0))).toFixed(3)
+          Math.max(
+            offsetStart,
+            Math.min(offsetStart + effectiveDuration, offsetStart + chunkStart + Math.max(0, Number(seg.start) || 0))
+          ).toFixed(3)
         );
         const rawEnd = Math.max(Number(seg.start) + 0.3, Number(seg.end) || Number(seg.start) + 2);
         const absEnd = Number(
-          Math.max(absStart + 0.2, Math.min(duration, chunkStart + Math.min(chunkLen, rawEnd))).toFixed(3)
+          Math.max(
+            absStart + 0.2,
+            Math.min(offsetStart + effectiveDuration, offsetStart + chunkStart + Math.min(chunkLen, rawEnd))
+          ).toFixed(3)
         );
 
         const offsetWords = (seg.words || []).map((w) => ({
           word: w.word,
-          start: chunkStart + Number(w.start || 0),
-          end: chunkStart + Number(w.end || 0),
+          start: offsetStart + chunkStart + Number(w.start || 0),
+          end: offsetStart + chunkStart + Number(w.end || 0),
         }));
 
         allSegments.push({
@@ -483,6 +533,8 @@ export async function transcribeVideoAudio(params: {
         videoPath,
         jobId,
         duration,
+        rangeStart,
+        rangeEnd,
         transcriptPath,
         whisperSettings,
         onProgress,
